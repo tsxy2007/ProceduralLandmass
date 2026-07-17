@@ -27,6 +27,8 @@ struct FTerrainType
 	FLinearColor Color;
 };
 
+
+
 /* 
 *	Function library class.
 *	Each function in it is expected to be static and represents blueprint node that can be called in any blueprint.
@@ -58,8 +60,11 @@ class UProceduralLandmassBPLibrary : public UBlueprintFunctionLibrary
 
 
 	UFUNCTION(BlueprintCallable)
-	static UTexture2D* GenerateNoiseTexture(int32 Width, int32 Height, const TArray<float>& OutNoiseMap);
+	static UTexture2D* GenerateNoiseTexture(int32 Width, int32 Height, const TArray<float>& InNoiseMap);
 
 	UFUNCTION(BlueprintCallable)
-	static UTexture2D* GenerateColorNoiseTexture(int32 Width, int32 Height,const TArray<FTerrainType>& TerrainTypes, const TArray<float>& OutNoiseMap);
+	static UTexture2D* GenerateColorNoiseTexture(int32 Width, int32 Height, const TArray<FTerrainType>& TerrainTypes, const TArray<float>& InNoiseMap);
+
+	UFUNCTION(BlueprintCallable)
+	static void GenerateTerrainMesh(int32 Width, int32 Height, const TArray<float>& InNoiseMap);
 };

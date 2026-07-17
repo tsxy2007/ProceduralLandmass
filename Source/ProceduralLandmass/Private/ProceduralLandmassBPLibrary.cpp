@@ -146,3 +146,7 @@ UTexture2D* UProceduralLandmassBPLibrary::GenerateColorNoiseTexture(int32 Width,
 	noiseTexture->UpdateResource();
 	return noiseTexture;
 }
+
+void UProceduralLandmassBPLibrary::GenerateTerrainMesh(int32 Width, int32 Height, const TArray<float>& InNoiseMap)
+{
+}
