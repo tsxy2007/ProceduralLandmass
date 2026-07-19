@@ -3,6 +3,7 @@
 #pragma once
 
 #include "Kismet/BlueprintFunctionLibrary.h"
+#include "Curves/CurveFloat.h"
 #include "ProceduralLandmassBPLibrary.generated.h"
 
 UENUM(BlueprintType)
@@ -10,6 +11,7 @@ enum class ENoiseDrawMode : uint8
 {
 	ENDM_Noise,
 	ENDM_Color,
+	ENDM_Mesh,
 };
 
 USTRUCT(BlueprintType)
@@ -66,5 +68,5 @@ class UProceduralLandmassBPLibrary : public UBlueprintFunctionLibrary
 	static UTexture2D* GenerateColorNoiseTexture(int32 Width, int32 Height, const TArray<FTerrainType>& TerrainTypes, const TArray<float>& InNoiseMap);
 
 	UFUNCTION(BlueprintCallable)
-	static void GenerateTerrainMesh(int32 Width, int32 Height, const TArray<float>& InNoiseMap);
+	static class UTerrainMeshData* GenerateTerrainMesh(int32 Width, int32 Height, float Scale, const TArray<float>& InNoiseMap, UCurveFloat* HeightCurve = nullptr, int32 LODLevels = 1);
 };
