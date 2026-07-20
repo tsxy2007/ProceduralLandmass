@@ -58,15 +58,15 @@ class UProceduralLandmassBPLibrary : public UBlueprintFunctionLibrary
 
 
 	UFUNCTION(BlueprintCallable)
-	static void GenerateNoiseMap(int32 Width, int32 Height, float Scale,int32 octaves,float persistance,float lacunarity, int32 Seed,const FVector2D& Offset, TArray<float>& OutNoiseMap);
+	static void GenerateNoiseMap(int32 ChunkSize, float Scale,int32 octaves,float persistance,float lacunarity, int32 Seed,const FVector2D& Offset, TArray<float>& OutNoiseMap);
 
 
 	UFUNCTION(BlueprintCallable)
-	static UTexture2D* GenerateNoiseTexture(int32 Width, int32 Height, const TArray<float>& InNoiseMap);
+	static UTexture2D* GenerateNoiseTexture(int32 ChunkSize, const TArray<float>& InNoiseMap);
 
 	UFUNCTION(BlueprintCallable)
-	static UTexture2D* GenerateColorNoiseTexture(int32 Width, int32 Height, const TArray<FTerrainType>& TerrainTypes, const TArray<float>& InNoiseMap);
+	static UTexture2D* GenerateColorNoiseTexture(int32 ChunkSize, const TArray<FTerrainType>& TerrainTypes, const TArray<float>& InNoiseMap);
 
 	UFUNCTION(BlueprintCallable)
-	static class UTerrainMeshData* GenerateTerrainMesh(int32 Width, int32 Height, float Scale, const TArray<float>& InNoiseMap, UCurveFloat* HeightCurve = nullptr, int32 LODLevels = 1);
+	static class UTerrainMeshData* GenerateTerrainMesh(int32 ChunkSize, float Scale, const TArray<float>& InNoiseMap, UCurveFloat* HeightCurve = nullptr, int32 LODLevels = 1);
 };

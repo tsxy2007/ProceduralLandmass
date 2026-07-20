@@ -11,22 +11,20 @@ UTerrainMeshData::UTerrainMeshData(const FObjectInitializer& ObjectInitializer)
 {
 }
 
-void UTerrainMeshData::Init(int32 InMeshWidth, int32 InMeshHeight, int32 InLODLevels)
+void UTerrainMeshData::Init(int32 InChunkSize, int32 InLODLevels)
 {
-	MeshWidth = InMeshWidth;
-	MeshHeight = InMeshHeight;
-	Vertices.SetNum(MeshWidth * MeshHeight);
-	UVs.SetNum(MeshWidth * MeshHeight);
-	Triangles.SetNum((MeshWidth - 1) * (MeshHeight - 1) * 6);
+	ChunkSize = InChunkSize;
+	Vertices.SetNum(ChunkSize * ChunkSize);
+	UVs.SetNum(ChunkSize * ChunkSize);
+	Triangles.SetNum((ChunkSize - 1) * (ChunkSize - 1) * 6);
 
 	LODData.SetNum(InLODLevels);
 	for (int32 LODIndex = 0; LODIndex < InLODLevels; ++LODIndex)
 	{
 		const int32 Step = 1 << LODIndex;
-		LODData[LODIndex].MeshWidth = ((MeshWidth - 1) / Step) + 1;
-		LODData[LODIndex].MeshHeight = ((MeshHeight - 1) / Step) + 1;
-		const int32 LodVertCount = LODData[LODIndex].MeshWidth * LODData[LODIndex].MeshHeight;
-		const int32 LodTriCount = (LODData[LODIndex].MeshWidth - 1) * (LODData[LODIndex].MeshHeight - 1) * 6;
+		LODData[LODIndex].ChunkSize = ((ChunkSize - 1) / Step) + 1;
+		const int32 LodVertCount = LODData[LODIndex].ChunkSize * LODData[LODIndex].ChunkSize;
+		const int32 LodTriCount = (LODData[LODIndex].ChunkSize - 1) * (LODData[LODIndex].ChunkSize - 1) * 6;
 		LODData[LODIndex].Vertices.SetNum(LodVertCount);
 		LODData[LODIndex].UVs.SetNum(LodVertCount);
 		LODData[LODIndex].Triangles.Empty(LodTriCount);
@@ -41,14 +39,13 @@ void UTerrainMeshData::AddTriangle(int32 a, int32 b, int32 c)
 	TriangleIndex += 3;
 }
 
-FLODMeshData& UTerrainMeshData::BeginLOD(int32 LODIndex, int32 LodWidth, int32 LodHeight)
+FLODMeshData& UTerrainMeshData::BeginLOD(int32 LODIndex, int32 LodSize)
 {
 	FLODMeshData& LOD = LODData[LODIndex];
-	LOD.MeshWidth = LodWidth;
-	LOD.MeshHeight = LodHeight;
-	LOD.Vertices.SetNum(LodWidth * LodHeight);
-	LOD.UVs.SetNum(LodWidth * LodHeight);
-	LOD.Triangles.Empty((LodWidth - 1) * (LodHeight - 1) * 6);
+	LOD.ChunkSize = LodSize;
+	LOD.Vertices.SetNum(LodSize * LodSize);
+	LOD.UVs.SetNum(LodSize * LodSize);
+	LOD.Triangles.Empty((LodSize - 1) * (LodSize - 1) * 6);
 	return LOD;
 }
 
@@ -145,7 +142,7 @@ UStaticMesh* UTerrainMeshData::CreateMesh()
 			return nullptr;
 		}
 
-		FMeshDescription MeshDescription = BuildMeshDescription({Vertices, UVs, Triangles, MeshWidth, MeshHeight});
+		FMeshDescription MeshDescription = BuildMeshDescription({Vertices, UVs, Triangles, ChunkSize});
 		TArray<const FMeshDescription*> MeshDescriptions;
 		MeshDescriptions.Add(&MeshDescription);
 		StaticMesh->BuildFromMeshDescriptions(MeshDescriptions);

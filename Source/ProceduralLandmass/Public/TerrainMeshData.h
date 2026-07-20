@@ -21,10 +21,7 @@ struct FLODMeshData
 	TArray<int32> Triangles;
 
 	UPROPERTY(EditAnywhere)
-	int32 MeshWidth = 0;
-
-	UPROPERTY(EditAnywhere)
-	int32 MeshHeight = 0;
+	int32 ChunkSize = 0;
 };
 
 /**
@@ -38,11 +35,11 @@ class PROCEDURALLANDMASS_API UTerrainMeshData : public UObject
 public:
 	UTerrainMeshData(const FObjectInitializer& ObjectInitializer);
 
-	void Init(int32 InMeshWidth, int32 InMeshHeight, int32 InLODLevels = 1);
+	void Init(int32 InChunkSize, int32 InLODLevels = 1);
 
 	void AddTriangle(int32 a, int32 b, int32 c);
 
-	FLODMeshData& BeginLOD(int32 LODIndex, int32 LodWidth, int32 LodHeight);
+	FLODMeshData& BeginLOD(int32 LODIndex, int32 LodSize);
 	void AddTriangleToLOD(FLODMeshData& LOD, int32 a, int32 b, int32 c);
 
 	UFUNCTION(BlueprintCallable)
@@ -59,10 +56,7 @@ public:
 	TArray<int32> Triangles;
 
 	UPROPERTY(EditAnywhere)
-	int32 MeshWidth;
-
-	UPROPERTY(EditAnywhere)
-	int32 MeshHeight;
+	int32 ChunkSize;
 
 	UPROPERTY(EditAnywhere)
 	int32 TriangleIndex = 0;
