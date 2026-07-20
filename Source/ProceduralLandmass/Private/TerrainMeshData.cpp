@@ -4,6 +4,7 @@
 #include "TerrainMeshData.h"
 #include "Engine/StaticMesh.h"
 #include "MeshDescription.h"
+#include "PhysicsEngine/BodySetup.h"
 #include "StaticMeshAttributes.h"
 
 UTerrainMeshData::UTerrainMeshData(const FObjectInitializer& ObjectInitializer)
@@ -147,6 +148,11 @@ UStaticMesh* UTerrainMeshData::CreateMesh()
 		MeshDescriptions.Add(&MeshDescription);
 		StaticMesh->BuildFromMeshDescriptions(MeshDescriptions);
 	}
+
+	// Setup physics collision: use render mesh as collision for triangle-accurate terrain
+	StaticMesh->CreateBodySetup();
+	UBodySetup* BodySetup = StaticMesh->GetBodySetup();
+	BodySetup->CollisionTraceFlag = CTF_UseComplexAsSimple;
 
 	return StaticMesh;
 }

@@ -37,19 +37,28 @@ void UProceduralLandmassBPLibrary::GenerateNoiseMap(int32 ChunkSize, float Scale
 	}
 	float halfSize = ChunkSize / 2.0f;
 
-	float maxNoiseHeight = TNumericLimits<float>::Lowest();
-	float minNoiseHeight = TNumericLimits<float>::Max();
+	// Precompute theoretical amplitude range for consistent normalization across chunks.
+	// fBm with octaves layers and persistance has range [-sum, sum] where sum = Σ persistence^i.
+	// Using a fixed range ensures adjacent chunks produce identical values at shared edges.
+	float theoreticalMax = 0.0f;
+	{
+		float amp = 1.0f;
+		for (int32 i = 0; i < octaves; i++)
+		{
+			theoreticalMax += amp;
+			amp *= persistance;
+		}
+	}
 
 	for (int32 y = 0; y < ChunkSize; y++)
 	{
 		for (int32 x = 0; x < ChunkSize; x++)
 		{
 			float amplitude = 1.0f;
-            float frequency = 1.0f;
+			float frequency = 1.0f;
 			float noiseHeight = 0.0f;
 			for (int32 i = 0; i < octaves; i++)
 			{
-
 				float sampleX = (x - halfSize + Offset.X) / Scale * frequency + octaveOffsets[i].X;
 				float sampleY = (y - halfSize + Offset.Y) / Scale * frequency + octaveOffsets[i].Y;
 
@@ -59,29 +68,15 @@ void UProceduralLandmassBPLibrary::GenerateNoiseMap(int32 ChunkSize, float Scale
 				amplitude *= persistance;
 				frequency *= lacunarity;
 			}
-			if (noiseHeight > maxNoiseHeight)
-			{
-				maxNoiseHeight = noiseHeight;
-			}
-			if (noiseHeight < minNoiseHeight)
-			{
-				minNoiseHeight = noiseHeight;
-			}
-			OutNoiseMap[y * ChunkSize + x] = noiseHeight;
-		}
-	}
 
-	float maxMinDelta = maxNoiseHeight - minNoiseHeight;
-	if (maxMinDelta > 0.f)
-	{
-		for (int32 y = 0; y < ChunkSize; y++)
-		{
-			for (int32 x = 0; x < ChunkSize; x++)
+			// Normalize by theoretical range: map [-theoreticalMax, theoreticalMax] → [0, 1]
+			float normalizedValue = 0.5f;
+			if (theoreticalMax > 0.0f)
 			{
-				float noiseHeight = OutNoiseMap[y * ChunkSize + x];
-				noiseHeight = (noiseHeight - minNoiseHeight) / maxMinDelta;
-				OutNoiseMap[y * ChunkSize + x] = noiseHeight;
+				normalizedValue = (noiseHeight / theoreticalMax + 1.0f) / 2.0f;
 			}
+
+			OutNoiseMap[y * ChunkSize + x] = normalizedValue;
 		}
 	}
 }
