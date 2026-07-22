@@ -68,5 +68,5 @@ class UProceduralLandmassBPLibrary : public UBlueprintFunctionLibrary
 	static UTexture2D* GenerateColorNoiseTexture(int32 ChunkSize, const TArray<FTerrainType>& TerrainTypes, const TArray<float>& InNoiseMap);
 
 	UFUNCTION(BlueprintCallable)
-	static class UTerrainMeshData* GenerateTerrainMesh(int32 ChunkSize, float Scale, const TArray<float>& InNoiseMap, UCurveFloat* HeightCurve = nullptr, int32 LODLevels = 1);
+	static class UTerrainMeshData* GenerateTerrainMesh(int32 ChunkSize, float HeightScale, const TArray<float>& InNoiseMap, UCurveFloat* HeightCurve = nullptr, int32 LODLevels = 1);
 };

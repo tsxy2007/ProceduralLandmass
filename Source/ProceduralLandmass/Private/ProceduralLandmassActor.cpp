@@ -42,7 +42,7 @@ void AProceduralLandmassActor::GenerateTerrain()
 	}
 
 	// 2. Build terrain mesh data
-	UTerrainMeshData* MeshData = UProceduralLandmassBPLibrary::GenerateTerrainMesh(ChunkSize, Scale, NoiseMap, HeightCurve, LODLevels);
+	UTerrainMeshData* MeshData = UProceduralLandmassBPLibrary::GenerateTerrainMesh(ChunkSize, HeightScale, NoiseMap, HeightCurve, LODLevels);
 	if (!MeshData)
 	{
 		return;

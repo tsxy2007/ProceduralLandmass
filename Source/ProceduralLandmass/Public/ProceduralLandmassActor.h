@@ -55,6 +55,8 @@ protected:
 	FVector2D Offset = FVector2D::ZeroVector;
 
 	// ---- Terrain shaping ----
+	UPROPERTY(EditAnywhere, Category = "Noise")
+	float HeightScale = 1000.0f;
 
 	UPROPERTY(EditAnywhere, Category = "Terrain")
 	TObjectPtr<UCurveFloat> HeightCurve;

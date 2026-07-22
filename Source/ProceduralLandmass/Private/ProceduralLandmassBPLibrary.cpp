@@ -142,7 +142,7 @@ UTexture2D* UProceduralLandmassBPLibrary::GenerateColorNoiseTexture(int32 ChunkS
 	return noiseTexture;
 }
 
-UTerrainMeshData* UProceduralLandmassBPLibrary::GenerateTerrainMesh(int32 ChunkSize, float Scale, const TArray<float>& InNoiseMap, UCurveFloat* HeightCurve, int32 LODLevels)
+UTerrainMeshData* UProceduralLandmassBPLibrary::GenerateTerrainMesh(int32 ChunkSize, float HeightScale, const TArray<float>& InNoiseMap, UCurveFloat* HeightCurve, int32 LODLevels)
 {
 	UTerrainMeshData* meshData = NewObject<UTerrainMeshData>();
 	meshData->Init(ChunkSize, LODLevels);
@@ -166,10 +166,10 @@ UTerrainMeshData* UProceduralLandmassBPLibrary::GenerateTerrainMesh(int32 ChunkS
 				const int32 SampleY = y * Step;
 				const float noiseValue = InNoiseMap[SampleY * ChunkSize + SampleX];
 
-				float heightValue = noiseValue * Scale;
+				float heightValue = noiseValue * HeightScale;
 				if (HeightCurve)
 				{
-					heightValue = HeightCurve->GetFloatValue(noiseValue) * Scale;
+					heightValue = HeightCurve->GetFloatValue(noiseValue) * HeightScale;
 				}
 
 				LOD.Vertices[vertexIndex] = FVector(x + topLeftX, topLeftY - y, heightValue);
