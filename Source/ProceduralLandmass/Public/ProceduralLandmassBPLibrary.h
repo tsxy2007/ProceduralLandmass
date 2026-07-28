@@ -14,6 +14,13 @@ enum class ENoiseDrawMode : uint8
 	ENDM_Mesh,
 };
 
+class UTerrainMeshData;
+
+// Async delegates (C++ only — not UHT-registered, used by the pipeline)
+DECLARE_DELEGATE_OneParam(FOnNoiseMapGenerated, const TArray<float>&);
+DECLARE_DELEGATE_OneParam(FOnNoiseTextureGenerated, UTexture2D*);
+DECLARE_DELEGATE_OneParam(FOnTerrainMeshGenerated, UTerrainMeshData*);
+
 USTRUCT(BlueprintType)
 struct FTerrainType 
 {
@@ -69,4 +76,12 @@ class UProceduralLandmassBPLibrary : public UBlueprintFunctionLibrary
 
 	UFUNCTION(BlueprintCallable)
 	static class UTerrainMeshData* GenerateTerrainMesh(int32 ChunkSize, float HeightScale, const TArray<float>& InNoiseMap, UCurveFloat* HeightCurve = nullptr, int32 LODLevels = 1);
+
+	// ---- Async variants (C++ only — pipeline uses delegates; Blueprint callers use GenerateTerrainAsync on the actor) ----
+
+	static void GenerateNoiseMapAsync(int32 ChunkSize, float Scale, int32 octaves, float persistance, float lacunarity, int32 Seed, const FVector2D& Offset, const FOnNoiseMapGenerated& OnComplete);
+
+	static void GenerateNoiseTextureAsync(int32 ChunkSize, const TArray<float>& InNoiseMap, const FOnNoiseTextureGenerated& OnComplete);
+
+	static void GenerateTerrainMeshAsync(int32 ChunkSize, float HeightScale, const TArray<float>& InNoiseMap, UCurveFloat* HeightCurve, int32 LODLevels, const FOnTerrainMeshGenerated& OnComplete);
 };

@@ -12,16 +12,15 @@ class UCurveFloat;
 class UMaterialInterface;
 
 /**
- * Async variant of AProceduralLandmassActor.
+ * Async variant of AProceduralLandmassActor using a pipeline + ticket queue pattern.
  *
- * The CPU-heavy noise map generation runs on a background thread. When it completes,
- * the work is marshalled back to the game thread to build the UStaticMesh (UObject
- * creation and BuildFromMeshDescriptions must happen on the game thread) and apply
- * the material to the mesh component.
+ * Pipeline: NoiseMap (background thread) -> TerrainMesh (game thread) -> ApplyMaterial (game thread).
+ * Each step checks a monotonically increasing ticket -- if a newer request supersedes
+ * the current one, the old pipeline discards itself. A TWeakObjectPtr guards against
+ * actor destruction mid-flight.
  *
- * A monotonically increasing generation ticket is used to ignore stale results from
- * superseded requests, and a TWeakObjectPtr guards against the actor being destroyed
- * before the background task finishes.
+ * Calling GenerateTerrainAsync() while a pipeline is already in flight bumps the
+ * ticket; the old pipeline naturally drains and the new one starts immediately.
  */
 UCLASS()
 class PROCEDURALLANDMASS_API AProceduralLandmassAsyncActor : public AActor
@@ -107,9 +106,14 @@ private:
 		TArray<FTerrainType> TerrainTypes;
 	};
 
-	void StartBackgroundGeneration(FGenSnapshot Snapshot, uint32 Ticket);
-	void ApplyGeneratedNoise(const TArray<float>& NoiseMap, const FGenSnapshot& Snapshot, uint32 Ticket);
-	void ApplyMaterial(const FGenSnapshot& Snapshot, const TArray<float>& NoiseMap);
+	/** Pipeline step 1: kick off background noise generation. */
+	void PipelineStep_NoiseMap(FGenSnapshot Snapshot, uint32 Ticket);
+
+	/** Pipeline step 2: build terrain mesh from noise data (game thread). */
+	void PipelineStep_TerrainMesh(const TArray<float>& NoiseMap, const FGenSnapshot& Snapshot, uint32 Ticket);
+
+	/** Pipeline step 3: apply material with optional color texture (game thread). */
+	void PipelineStep_ApplyMaterial(const FGenSnapshot& Snapshot, const TArray<float>& NoiseMap);
 
 	/** True while a background task is in flight. Atomically read/written from multiple threads. */
 	FThreadSafeBool bIsGenerating;

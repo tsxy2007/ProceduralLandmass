@@ -48,77 +48,95 @@ void AProceduralLandmassAsyncActor::GenerateTerrainAsync()
 	Snapshot.Offset = Offset;
 	Snapshot.HeightScale = HeightScale;
 	Snapshot.HeightCurve = HeightCurve;
-	Snapshot.LODLevels = LODLevels;
+	Snapshot.LODLevels = FMath::Clamp(LODLevels, 1, 8);
 	Snapshot.Material = Material;
 	Snapshot.TerrainTypes = TerrainTypes;
 
 	const uint32 Ticket = ++GenerationTicket;
-	StartBackgroundGeneration(MoveTemp(Snapshot), Ticket);
+	PipelineStep_NoiseMap(MoveTemp(Snapshot), Ticket);
 }
 
-void AProceduralLandmassAsyncActor::StartBackgroundGeneration(FGenSnapshot Snapshot, uint32 Ticket)
+void AProceduralLandmassAsyncActor::PipelineStep_NoiseMap(FGenSnapshot Snapshot, uint32 Ticket)
 {
 	bIsGenerating = true;
 
-	// Capture a weak pointer so the background task can bail if the actor is destroyed.
+	FOnNoiseMapGenerated OnComplete;
 	const TWeakObjectPtr<AProceduralLandmassAsyncActor> WeakThis(this);
 
-	Async(EAsyncExecution::Thread, [WeakThis, Snapshot = MoveTemp(Snapshot), Ticket]()
+	OnComplete.BindLambda([WeakThis, Snapshot = MoveTemp(Snapshot), Ticket](const TArray<float>& NoiseMap)
 	{
-		TArray<float> NoiseMap;
-		UProceduralLandmassBPLibrary::GenerateNoiseMap(
-			Snapshot.ChunkSize, Snapshot.Scale, Snapshot.Octaves, Snapshot.Persistence,
-			Snapshot.Lacunarity, Snapshot.Seed, Snapshot.Offset, NoiseMap);
-
-		// Marshal back to the game thread to create the UStaticMesh and update the component.
-		AsyncTask(ENamedThreads::GameThread, [WeakThis, Snapshot, NoiseMap = MoveTemp(NoiseMap), Ticket]()
+		if (AProceduralLandmassAsyncActor* This = WeakThis.Get())
 		{
-			if (AProceduralLandmassAsyncActor* This = WeakThis.Get())
+			if (This->bDestroying || Ticket != This->GenerationTicket.load())
 			{
-				This->ApplyGeneratedNoise(NoiseMap, Snapshot, Ticket);
+				This->bIsGenerating = false;
+				return;
 			}
-		});
+
+			if (NoiseMap.Num() == 0)
+			{
+				This->bIsGenerating = false;
+				return;
+			}
+
+			This->PipelineStep_TerrainMesh(NoiseMap, Snapshot, Ticket);
+		}
 	});
+
+	UProceduralLandmassBPLibrary::GenerateNoiseMapAsync(
+		Snapshot.ChunkSize, Snapshot.Scale, Snapshot.Octaves, Snapshot.Persistence,
+		Snapshot.Lacunarity, Snapshot.Seed, Snapshot.Offset, OnComplete);
 }
 
-void AProceduralLandmassAsyncActor::ApplyGeneratedNoise(const TArray<float>& NoiseMap, const FGenSnapshot& Snapshot, uint32 Ticket)
+void AProceduralLandmassAsyncActor::PipelineStep_TerrainMesh(const TArray<float>& NoiseMap, const FGenSnapshot& Snapshot, uint32 Ticket)
 {
-	bIsGenerating = false;
-
-	// Discard stale results from superseded requests, and skip if the actor is tearing down.
 	if (bDestroying || Ticket != GenerationTicket.load())
 	{
+		bIsGenerating = false;
 		return;
 	}
 
-	if (NoiseMap.Num() == 0)
+	const TWeakObjectPtr<AProceduralLandmassAsyncActor> WeakThis(this);
+
+	FOnTerrainMeshGenerated OnComplete;
+	OnComplete.BindLambda([WeakThis, Snapshot, NoiseMap, Ticket](UTerrainMeshData* MeshData)
 	{
-		return;
-	}
+		if (AProceduralLandmassAsyncActor* This = WeakThis.Get())
+		{
+			if (This->bDestroying || Ticket != This->GenerationTicket.load())
+			{
+				This->bIsGenerating = false;
+				return;
+			}
 
-	UTerrainMeshData* MeshData = UProceduralLandmassBPLibrary::GenerateTerrainMesh(
+			if (!MeshData)
+			{
+				This->bIsGenerating = false;
+				return;
+			}
+
+			This->GeneratedMesh = MeshData->CreateMesh();
+			if (!This->GeneratedMesh)
+			{
+				This->bIsGenerating = false;
+				return;
+			}
+
+			This->TerrainMeshComponent->SetStaticMesh(This->GeneratedMesh);
+			This->PipelineStep_ApplyMaterial(Snapshot, NoiseMap);
+		}
+	});
+
+	UProceduralLandmassBPLibrary::GenerateTerrainMeshAsync(
 		Snapshot.ChunkSize, Snapshot.HeightScale, NoiseMap,
-		Snapshot.HeightCurve.Get(), Snapshot.LODLevels);
-	if (!MeshData)
-	{
-		return;
-	}
-
-	GeneratedMesh = MeshData->CreateMesh();
-	if (!GeneratedMesh)
-	{
-		return;
-	}
-
-	TerrainMeshComponent->SetStaticMesh(GeneratedMesh);
-
-	ApplyMaterial(Snapshot, NoiseMap);
+		Snapshot.HeightCurve.Get(), Snapshot.LODLevels, OnComplete);
 }
 
-void AProceduralLandmassAsyncActor::ApplyMaterial(const FGenSnapshot& Snapshot, const TArray<float>& NoiseMap)
+void AProceduralLandmassAsyncActor::PipelineStep_ApplyMaterial(const FGenSnapshot& Snapshot, const TArray<float>& NoiseMap)
 {
 	if (!Snapshot.Material.IsValid())
 	{
+		bIsGenerating = false;
 		return;
 	}
 
@@ -132,9 +150,11 @@ void AProceduralLandmassAsyncActor::ApplyMaterial(const FGenSnapshot& Snapshot, 
 			UMaterialInstanceDynamic* DynMat = UMaterialInstanceDynamic::Create(MaterialToApply, this);
 			DynMat->SetTextureParameterValue(TEXT("TerrainColorTexture"), ColorTexture);
 			TerrainMeshComponent->SetMaterial(0, DynMat);
+			bIsGenerating = false;
 			return;
 		}
 	}
 
 	TerrainMeshComponent->SetMaterial(0, MaterialToApply);
+	bIsGenerating = false;
 }

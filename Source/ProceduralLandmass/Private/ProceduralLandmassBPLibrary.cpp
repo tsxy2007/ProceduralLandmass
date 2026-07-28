@@ -3,6 +3,7 @@
 #include "ProceduralLandmassBPLibrary.h"
 #include "ProceduralLandmass.h"
 #include "TerrainMeshData.h"
+#include "Async/Async.h"
 
 UProceduralLandmassBPLibrary::UProceduralLandmassBPLibrary(const FObjectInitializer& ObjectInitializer)
 : Super(ObjectInitializer)
@@ -196,4 +197,30 @@ UTerrainMeshData* UProceduralLandmassBPLibrary::GenerateTerrainMesh(int32 ChunkS
 	}
 
 	return meshData;
+}
+
+void UProceduralLandmassBPLibrary::GenerateNoiseMapAsync(int32 ChunkSize, float Scale, int32 octaves, float persistance, float lacunarity, int32 Seed, const FVector2D& Offset, const FOnNoiseMapGenerated& OnComplete)
+{
+	Async(EAsyncExecution::Thread, [ChunkSize, Scale, octaves, persistance, lacunarity, Seed, Offset, OnComplete]()
+	{
+		TArray<float> NoiseMap;
+		GenerateNoiseMap(ChunkSize, Scale, octaves, persistance, lacunarity, Seed, Offset, NoiseMap);
+
+		AsyncTask(ENamedThreads::GameThread, [OnComplete, NoiseMap = MoveTemp(NoiseMap)]()
+		{
+			OnComplete.ExecuteIfBound(NoiseMap);
+		});
+	});
+}
+
+void UProceduralLandmassBPLibrary::GenerateNoiseTextureAsync(int32 ChunkSize, const TArray<float>& InNoiseMap, const FOnNoiseTextureGenerated& OnComplete)
+{
+	UTexture2D* Texture = GenerateNoiseTexture(ChunkSize, InNoiseMap);
+	OnComplete.ExecuteIfBound(Texture);
+}
+
+void UProceduralLandmassBPLibrary::GenerateTerrainMeshAsync(int32 ChunkSize, float HeightScale, const TArray<float>& InNoiseMap, UCurveFloat* HeightCurve, int32 LODLevels, const FOnTerrainMeshGenerated& OnComplete)
+{
+	UTerrainMeshData* MeshData = GenerateTerrainMesh(ChunkSize, HeightScale, InNoiseMap, HeightCurve, LODLevels);
+	OnComplete.ExecuteIfBound(MeshData);
 }
