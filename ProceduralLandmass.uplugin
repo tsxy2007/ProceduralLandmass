@@ -18,7 +18,7 @@
 		{
 			"Name": "ProceduralLandmass",
 			"Type": "Runtime",
-			"LoadingPhase": "PreLoadingScreen"
+			"LoadingPhase": "PostConfigInit"
 		}
 	]
 }
