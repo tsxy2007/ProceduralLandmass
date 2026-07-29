@@ -7,6 +7,7 @@
 #include "RenderGraphResources.h"
 #include "RenderGraphUtils.h"
 #include "RenderGraphBuilder.h"
+#include "RHIGPUReadback.h"
 
 // ── Thread-group dimensions (must match the HLSL [numthreads] declaration) ──
 
@@ -21,6 +22,16 @@ DECLARE_STATS_GROUP(TEXT("ProceduralLandmassNoiseCS"),
 
 DECLARE_CYCLE_STAT(TEXT("ProceduralLandmassNoiseCS Execute"),
 	STAT_ProceduralLandmassNoiseCS_Execute, STATGROUP_ProceduralLandmassNoiseCS);
+
+static TAutoConsoleVariable<int32> CVarNoiseCSReadback(
+	TEXT("r.ProceduralLandmass.NoiseCS.Readback"),
+	0,
+	TEXT("0: Off (default)\n")
+	TEXT("1: Log summary (min/max/avg + 10×10 corner)\n")
+	TEXT("2: Log every pixel value"),
+	ECVF_RenderThreadSafe);
+
+DEFINE_LOG_CATEGORY_STATIC(LogProceduralLandmassNoiseCS, Log, All);
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  FGlobalShader: binds C++ side → HLSL
@@ -108,6 +119,15 @@ void FProceduralLandmassNoiseCSInterface::DispatchRenderThread(
 
 	FRDGBuilder GraphBuilder(RHICmdList);
 
+	// Debug readback object — must outlive GraphBuilder.Execute()
+	FRHIGPUTextureReadback NoiseReadback(TEXT("ProceduralLandmassNoiseReadback"));
+	const int32 ReadbackMode = CVarNoiseCSReadback.GetValueOnRenderThread();
+	FRDGTextureRef TmpTextureForReadback = nullptr;
+
+	UE_LOG(LogProceduralLandmassNoiseCS, Log,
+		TEXT("[Readback] DispatchRenderThread entered  ReadbackMode=%d  ChunkSize=%d  RT=%p"),
+		ReadbackMode, Params.ChunkSize, Params.RenderTarget);
+
 	{
 		SCOPE_CYCLE_COUNTER(STAT_ProceduralLandmassNoiseCS_Execute);
 		DECLARE_GPU_STAT(ProceduralLandmassNoiseCS);
@@ -118,7 +138,11 @@ void FProceduralLandmassNoiseCSInterface::DispatchRenderThread(
 		TShaderMapRef<FProceduralLandmassNoiseCS> ComputeShader(
 			GetGlobalShaderMap(GMaxRHIFeatureLevel), PermutationVector);
 
-		if (ComputeShader.IsValid())
+		const bool bShaderValid = ComputeShader.IsValid();
+		UE_LOG(LogProceduralLandmassNoiseCS, Log,
+			TEXT("[Readback] Shader valid: %d"), bShaderValid ? 1 : 0);
+
+		if (bShaderValid)
 		{
 			FProceduralLandmassNoiseCS::FParameters* PassParameters =
 				GraphBuilder.AllocParameters<
@@ -173,10 +197,115 @@ void FProceduralLandmassNoiseCSInterface::DispatchRenderThread(
 				AddCopyTexturePass(GraphBuilder, TmpTexture, TargetTexture,
 					FRHICopyTextureInfo());
 			}
+
+			// Enqueue readback from intermediate texture
+			if (ReadbackMode > 0)
+			{
+				TmpTextureForReadback = TmpTexture;
+				AddEnqueueCopyPass(GraphBuilder, &NoiseReadback, TmpTexture);
+				UE_LOG(LogProceduralLandmassNoiseCS, Log,
+					TEXT("[Readback] Readback pass enqueued  TmpTextureForReadback=%p"), TmpTextureForReadback);
+			}
+			else
+			{
+				UE_LOG(LogProceduralLandmassNoiseCS, Verbose,
+					TEXT("[Readback] Skipped — ReadbackMode=%d"), ReadbackMode);
+			}
 		}
 	}
 
 	GraphBuilder.Execute();
+
+	UE_LOG(LogProceduralLandmassNoiseCS, Log,
+		TEXT("[Readback] Post-Execute  ReadbackMode=%d  TmpTextureForReadback=%p"),
+		ReadbackMode, TmpTextureForReadback);
+
+	// ── Readback & log ────────────────────────────────────────────────────
+	if (ReadbackMode > 0 && TmpTextureForReadback)
+	{
+		// Ensure GPU has finished so readback data is available
+		RHICmdList.BlockUntilGPUIdle();
+
+		if (NoiseReadback.IsReady())
+		{
+			int32 RowPitchInPixels = 0;
+			const float* Data = static_cast<const float*>(
+				NoiseReadback.Lock(RowPitchInPixels));
+
+			if (Data)
+			{
+				const int32 TotalPixels = Params.ChunkSize * Params.ChunkSize;
+				const int32 RowStride = (RowPitchInPixels > 0)
+					? RowPitchInPixels : Params.ChunkSize;
+
+				UE_LOG(LogProceduralLandmassNoiseCS, Log,
+					TEXT("=== NoiseCS RenderTarget Readback ==="));
+				UE_LOG(LogProceduralLandmassNoiseCS, Log,
+					TEXT("  Size: %dx%d  Total pixels: %d  RowPitch: %d"),
+					Params.ChunkSize, Params.ChunkSize, TotalPixels, RowPitchInPixels);
+
+				// Compute statistics
+				float MinVal = TNumericLimits<float>::Max();
+				float MaxVal = TNumericLimits<float>::Lowest();
+				double Sum = 0.0;
+				int32 ZeroCount = 0;
+
+				for (int32 i = 0; i < TotalPixels; ++i)
+				{
+					const float Val = Data[i];
+					MinVal = FMath::Min(MinVal, Val);
+					MaxVal = FMath::Max(MaxVal, Val);
+					Sum += static_cast<double>(Val);
+					if (Val == 0.0f) { ++ZeroCount; }
+				}
+
+				UE_LOG(LogProceduralLandmassNoiseCS, Log,
+					TEXT("  Min: %.6f  Max: %.6f  Avg: %.6f  ZeroPixels: %d"),
+					MinVal, MaxVal, Sum / static_cast<double>(TotalPixels), ZeroCount);
+
+				// Print 10×10 corner samples
+				UE_LOG(LogProceduralLandmassNoiseCS, Log,
+					TEXT("  ── Top-left 10×10 corner ──"));
+				const int32 SampleSize = Params.ChunkSize;// FMath::Min(10, Params.ChunkSize);
+				for (int32 Y = 0; Y < SampleSize; ++Y)
+				{
+					FString RowStr;
+					for (int32 X = 0; X < SampleSize; ++X)
+					{
+						RowStr += FString::Printf(TEXT("%.3f "),
+							Data[Y * RowStride + X]);
+					}
+					UE_LOG(LogProceduralLandmassNoiseCS, Log,
+						TEXT("    [%02d] %s"), Y, *RowStr);
+				}
+
+				// Mode 2: dump every pixel
+				if (ReadbackMode >= 2)
+				{
+					UE_LOG(LogProceduralLandmassNoiseCS, Log,
+						TEXT("  ── Full pixel dump ──"));
+					for (int32 Y = 0; Y < Params.ChunkSize; ++Y)
+					{
+						FString RowStr;
+						for (int32 X = 0; X < Params.ChunkSize; ++X)
+						{
+							RowStr += FString::Printf(TEXT("%.4f "),
+								Data[Y * RowStride + X]);
+						}
+						UE_LOG(LogProceduralLandmassNoiseCS, Log,
+							TEXT("    [%04d] %s"), Y, *RowStr);
+					}
+				}
+
+				NoiseReadback.Unlock();
+			}
+		}
+		else
+		{
+			UE_LOG(LogProceduralLandmassNoiseCS, Warning,
+				TEXT("NoiseCS readback not ready after BlockUntilGPUIdle"));
+		}
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
