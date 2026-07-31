@@ -26,6 +26,18 @@ float2 Offset;
 
 RWTexture2D<float> RenderTarget;
 
+// ── Terrain-type color lookup ───────────────────────────────────────────────
+
+struct FTerrainTypeGPU
+{
+	float  NoiseHeight;   // offset 0
+	float4 Color;         // offset 16 (float4 在 HLSL structured buffer 中对齐到 16 bytes)
+};
+
+StructuredBuffer<FTerrainTypeGPU> TerrainTypes;
+int  NumTerrainTypes;
+RWTexture2D<float4> ColorRenderTarget;  // RGBA8 颜色输出
+
 // ── Thread-group size (set via ModifyCompilationEnvironment) ────────────────
 
 #ifndef THREADGROUPSIZE_X
@@ -141,5 +153,17 @@ void MainComputeShader(uint3 DispatchThreadId : SV_DispatchThreadID)
 
 	// Map [-1, 1] → [0, 1]
 	float normalized = (noise + 1.0) * 0.5;
+
+	// Color lookup from terrain types (threshold-based, first-match wins)
+	float4 outColor = float4(0.0, 0.0, 0.0, 1.0);
+	for (int i = 0; i < NumTerrainTypes; i++)
+	{
+		if (normalized <= TerrainTypes[i].NoiseHeight)
+		{
+			outColor = TerrainTypes[i].Color;
+			break;
+		}
+	}
+	ColorRenderTarget[uint2(x, y)] = outColor;
 	RenderTarget[uint2(x, y)] = normalized;
 }

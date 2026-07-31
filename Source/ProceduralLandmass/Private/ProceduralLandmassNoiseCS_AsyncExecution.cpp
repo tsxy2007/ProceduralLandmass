@@ -8,7 +8,7 @@
 #include "RenderGraphUtils.h"
 #include "RenderGraphBuilder.h"
 #include "RHIGPUReadback.h"
-
+UE_DISABLE_OPTIMIZATION
 // ── Thread-group dimensions (must match the HLSL [numthreads] declaration) ──
 
 #define NUM_THREADS_PER_GROUP_X 8
@@ -37,6 +37,23 @@ DEFINE_LOG_CATEGORY_STATIC(LogProceduralLandmassNoiseCS, Log, All);
 //  FGlobalShader: binds C++ side → HLSL
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** GPU-side mirror of FTerrainType with correct HLSL structured-buffer alignment.
+ *  float4 in HLSL is 16-byte aligned, so the C++ struct must match with padding. */
+struct FTerrainTypeGPU
+{
+	float NoiseHeight;      // offset 0,  sizeof 4
+	float _Padding[3];      // offset 4,  sizeof 12 → align Color to 16
+	float ColorR, ColorG, ColorB, ColorA;  // offset 16, sizeof 16
+
+	FTerrainTypeGPU() = default;
+	explicit FTerrainTypeGPU(const FTerrainType& Src)
+		: NoiseHeight(Src.NoiseHeight)
+		, ColorR(Src.Color.R), ColorG(Src.Color.G)
+		, ColorB(Src.Color.B), ColorA(Src.Color.A)
+	{}
+};
+static_assert(sizeof(FTerrainTypeGPU) == 32, "FTerrainTypeGPU must match HLSL 32-byte layout");
+
 class FProceduralLandmassNoiseCS : public FGlobalShader
 {
 public:
@@ -45,6 +62,9 @@ public:
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, RenderTarget)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, ColorRenderTarget)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FTerrainTypeGPU>, TerrainTypes)
+		SHADER_PARAMETER(int32, NumTerrainTypes)
 		SHADER_PARAMETER(int32, ChunkSize)
 		SHADER_PARAMETER(float, Scale)
 		SHADER_PARAMETER(int32, Octaves)
@@ -134,6 +154,22 @@ void FProceduralLandmassNoiseCSInterface::DispatchRenderThread(
 		RDG_EVENT_SCOPE(GraphBuilder, "ProceduralLandmassNoiseCS");
 		RDG_GPU_STAT_SCOPE(GraphBuilder, ProceduralLandmassNoiseCS);
 
+		// Prepare terrain-type data for GPU structured buffer
+		TArray<FTerrainTypeGPU> GPUTerrainTypes;
+		GPUTerrainTypes.Reserve(Params.TerrainTypes.Num());
+		for (const FTerrainType& TT : Params.TerrainTypes)
+		{
+			GPUTerrainTypes.Emplace(TT);
+			UE_LOG(LogProceduralLandmassNoiseCS, Log,
+				TEXT("[Color] TerrainType: Name=%s  NoiseHeight=%.3f  Color=(%.3f,%.3f,%.3f,%.3f)"),
+				*TT.Name, TT.NoiseHeight, TT.Color.R, TT.Color.G, TT.Color.B, TT.Color.A);
+		}
+		const int32 NumTerrainTypes = GPUTerrainTypes.Num();
+		const bool bHasColorOutput = Params.ColorRenderTarget != nullptr && NumTerrainTypes > 0;
+		UE_LOG(LogProceduralLandmassNoiseCS, Log,
+			TEXT("[Color] NumTerrainTypes=%d  ColorRenderTarget=%p  bHasColorOutput=%d"),
+			NumTerrainTypes, Params.ColorRenderTarget, bHasColorOutput ? 1 : 0);
+
 		typename FProceduralLandmassNoiseCS::FPermutationDomain PermutationVector;
 		TShaderMapRef<FProceduralLandmassNoiseCS> ComputeShader(
 			GetGlobalShaderMap(GMaxRHIFeatureLevel), PermutationVector);
@@ -164,6 +200,36 @@ void FProceduralLandmassNoiseCSInterface::DispatchRenderThread(
 				Params.RenderTarget->GetRenderTargetTexture(),
 				TEXT("ProceduralLandmassNoiseCS_RT"));
 
+			// Color output texture (RGBA8, same dimensions)
+			FRDGTextureRef TmpColorTexture = nullptr;
+			FRDGTextureRef TargetColorTexture = nullptr;
+			if (bHasColorOutput)
+			{
+				// Register external first so we can match its format
+				TargetColorTexture = RegisterExternalTexture(
+					GraphBuilder,
+					Params.ColorRenderTarget->GetRenderTargetTexture(),
+					TEXT("ProceduralLandmassNoiseCS_ColorRT"));
+
+				FRDGTextureDesc ColorDesc(FRDGTextureDesc::Create2D(
+					FIntPoint(Params.ChunkSize, Params.ChunkSize),
+					TargetColorTexture->Desc.Format,
+					FClearValueBinding::Black,
+					TexCreate_ShaderResource | TexCreate_UAV));
+
+				TmpColorTexture = GraphBuilder.CreateTexture(
+					ColorDesc, TEXT("ProceduralLandmassNoiseCS_ColorTemp"));
+			}
+
+			// Structured buffer for terrain types (always create, even if empty)
+			FRDGBufferRef TerrainTypesBuffer = CreateStructuredBuffer(
+				GraphBuilder,
+				TEXT("TerrainTypesBuffer"),
+				sizeof(FTerrainTypeGPU),
+				FMath::Max(NumTerrainTypes, 1),  // minimum 1 element for empty case
+				NumTerrainTypes > 0 ? GPUTerrainTypes.GetData() : nullptr,
+				NumTerrainTypes * sizeof(FTerrainTypeGPU));
+
 			PassParameters->RenderTarget = GraphBuilder.CreateUAV(TmpTexture);
 			PassParameters->ChunkSize    = Params.ChunkSize;
 			PassParameters->Scale        = Params.Scale;
@@ -174,6 +240,14 @@ void FProceduralLandmassNoiseCSInterface::DispatchRenderThread(
 			PassParameters->Offset       = FVector2f(
 				static_cast<float>(Params.Offset.X),
 				static_cast<float>(Params.Offset.Y));
+
+			// Color output binding (always bind; fallback to height texture UAV when no color needed)
+			PassParameters->ColorRenderTarget = bHasColorOutput
+				? GraphBuilder.CreateUAV(TmpColorTexture)
+				: GraphBuilder.CreateUAV(TmpTexture);  // fallback: bind height texture (unused when NumTerrainTypes==0)
+
+			PassParameters->TerrainTypes = GraphBuilder.CreateSRV(TerrainTypesBuffer);
+			PassParameters->NumTerrainTypes = NumTerrainTypes;
 
 			auto GroupCount = FComputeShaderUtils::GetGroupCount(
 				FIntVector(Params.ChunkSize, Params.ChunkSize, 1),
@@ -195,6 +269,13 @@ void FProceduralLandmassNoiseCSInterface::DispatchRenderThread(
 			if (TargetTexture->Desc.Format == PF_R32_FLOAT)
 			{
 				AddCopyTexturePass(GraphBuilder, TmpTexture, TargetTexture,
+					FRHICopyTextureInfo());
+			}
+
+			// Copy intermediate color → external color RT
+			if (bHasColorOutput)
+			{
+				AddCopyTexturePass(GraphBuilder, TmpColorTexture, TargetColorTexture,
 					FRHICopyTextureInfo());
 			}
 
@@ -316,7 +397,14 @@ void UProceduralLandmassNoiseCS_AsyncExecution::Activate()
 {
 	FProceduralLandmassNoiseCSParameters Params(
 		ChunkSize, Scale, Octaves, Persistence, Lacunarity, Seed, Offset);
+
 	Params.RenderTarget = RT->GameThread_GetRenderTargetResource();
+
+	if (ColorRT && TerrainTypes.Num() > 0)
+	{
+		Params.ColorRenderTarget = ColorRT->GameThread_GetRenderTargetResource();
+		Params.TerrainTypes = TerrainTypes;
+	}
 
 	FProceduralLandmassNoiseCSInterface::Dispatch(Params);
 }
@@ -324,14 +412,16 @@ void UProceduralLandmassNoiseCS_AsyncExecution::Activate()
 UProceduralLandmassNoiseCS_AsyncExecution*
 UProceduralLandmassNoiseCS_AsyncExecution::ExecuteGPUNoiseMap(
 	UObject* WorldContextObject,
-	UTextureRenderTarget2D* RT,
+	const TArray<FTerrainType>& TerrainTypes,
 	int32 ChunkSize,
 	float Scale,
 	int32 Octaves,
 	float Persistence,
 	float Lacunarity,
 	int32 Seed,
-	FVector2D Offset)
+	FVector2D Offset,
+	UTextureRenderTarget2D* RT,
+	UTextureRenderTarget2D* ColorRT)
 {
 	UProceduralLandmassNoiseCS_AsyncExecution* Action =
 		NewObject<UProceduralLandmassNoiseCS_AsyncExecution>();
@@ -343,7 +433,11 @@ UProceduralLandmassNoiseCS_AsyncExecution::ExecuteGPUNoiseMap(
 	Action->Lacunarity  = Lacunarity;
 	Action->Seed        = Seed;
 	Action->Offset      = Offset;
+	Action->ColorRT      = ColorRT;
+	Action->TerrainTypes = TerrainTypes;
 	Action->RegisterWithGameInstance(WorldContextObject);
 
 	return Action;
 }
+
+UE_ENABLE_OPTIMIZATION

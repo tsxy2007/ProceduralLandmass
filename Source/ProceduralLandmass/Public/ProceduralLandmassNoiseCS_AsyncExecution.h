@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintAsyncActionBase.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "ProceduralLandmassBPLibrary.h"
 #include "ProceduralLandmassNoiseCS_AsyncExecution.generated.h"
 
 /**
@@ -21,6 +22,8 @@ struct FProceduralLandmassNoiseCSParameters
 	int         Seed         = 0;
 	FVector2D   Offset       = FVector2D::ZeroVector;
 	FRenderTarget* RenderTarget = nullptr;
+	FRenderTarget* ColorRenderTarget = nullptr;  // RGBA8 color output
+	TArray<FTerrainType> TerrainTypes;           // Terrain type array
 
 	FProceduralLandmassNoiseCSParameters() = default;
 
@@ -31,6 +34,18 @@ struct FProceduralLandmassNoiseCSParameters
 		: ChunkSize(InChunkSize), Scale(InScale), Octaves(InOctaves)
 		, Persistence(InPersistence), Lacunarity(InLacunarity)
 		, Seed(InSeed), Offset(InOffset)
+	{}
+
+	FProceduralLandmassNoiseCSParameters(
+		int InChunkSize, float InScale, int InOctaves,
+		float InPersistence, float InLacunarity, int InSeed,
+		const FVector2D& InOffset,
+		FRenderTarget* InColorRenderTarget,
+		const TArray<FTerrainType>& InTerrainTypes)
+		: ChunkSize(InChunkSize), Scale(InScale), Octaves(InOctaves)
+		, Persistence(InPersistence), Lacunarity(InLacunarity)
+		, Seed(InSeed), Offset(InOffset)
+		, ColorRenderTarget(InColorRenderTarget), TerrainTypes(InTerrainTypes)
 	{}
 };
 
@@ -85,14 +100,16 @@ public:
 			WorldContext = "WorldContextObject"))
 	static UProceduralLandmassNoiseCS_AsyncExecution* ExecuteGPUNoiseMap(
 		UObject* WorldContextObject,
-		UTextureRenderTarget2D* RT,
+		const TArray<FTerrainType>& InTerrainTypes,
 		int32 ChunkSize  = 256,
 		float Scale      = 1.0f,
 		int32 Octaves    = 4,
 		float Persistence = 0.5f,
 		float Lacunarity = 2.0f,
-		int32 Seed       = 0,
-		FVector2D Offset = FVector2D::ZeroVector);
+		int32 Seed = 0,
+		FVector2D Offset = FVector2D::ZeroVector,
+		UTextureRenderTarget2D* RT = nullptr,
+		UTextureRenderTarget2D* ColorRT = nullptr);
 
 	UPROPERTY()
 	TObjectPtr<UTextureRenderTarget2D> RT;
@@ -117,4 +134,10 @@ public:
 
 	UPROPERTY()
 	FVector2D Offset;
+
+	UPROPERTY()
+	TObjectPtr<UTextureRenderTarget2D> ColorRT;
+
+	UPROPERTY()
+	TArray<FTerrainType> TerrainTypes;
 };

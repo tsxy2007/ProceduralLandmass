@@ -8,6 +8,7 @@
 #include "Engine/StaticMesh.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Async/Async.h"
+#include "ProceduralLandmassNoiseCS_AsyncExecution.h"
 
 AProceduralLandmassAsyncActor::AProceduralLandmassAsyncActor()
 {
@@ -144,15 +145,41 @@ void AProceduralLandmassAsyncActor::PipelineStep_ApplyMaterial(const FGenSnapsho
 
 	if (Snapshot.TerrainTypes.Num() > 0)
 	{
-		if (UTexture2D* ColorTexture = UProceduralLandmassBPLibrary::GenerateColorNoiseTexture(
-			Snapshot.ChunkSize, Snapshot.TerrainTypes, NoiseMap))
-		{
-			UMaterialInstanceDynamic* DynMat = UMaterialInstanceDynamic::Create(MaterialToApply, this);
-			DynMat->SetTextureParameterValue(TEXT("TerrainColorTexture"), ColorTexture);
-			TerrainMeshComponent->SetMaterial(0, DynMat);
-			bIsGenerating = false;
-			return;
-		}
+		// Create transient RGBA8 RenderTarget for GPU color output
+		UTextureRenderTarget2D* ColorRT = NewObject<UTextureRenderTarget2D>(this);
+		ColorRT->RenderTargetFormat = RTF_RGBA8;
+		ColorRT->InitAutoFormat(Snapshot.ChunkSize, Snapshot.ChunkSize);
+		ColorRT->UpdateResourceImmediate(true);
+
+		// Dispatch GPU compute shader — generates noise height + color texture
+		FProceduralLandmassNoiseCSParameters CSParams(
+			Snapshot.ChunkSize, Snapshot.Scale, Snapshot.Octaves,
+			Snapshot.Persistence, Snapshot.Lacunarity, Snapshot.Seed,
+			Snapshot.Offset);
+
+		// Height output RT (must match ChunkSize × ChunkSize, PF_R32_FLOAT)
+		UTextureRenderTarget2D* HeightRT = NewObject<UTextureRenderTarget2D>(this);
+		HeightRT->RenderTargetFormat = RTF_R32f;
+		HeightRT->InitAutoFormat(Snapshot.ChunkSize, Snapshot.ChunkSize);
+		HeightRT->UpdateResourceImmediate(true);
+
+		CSParams.RenderTarget = HeightRT->GameThread_GetRenderTargetResource();
+		CSParams.ColorRenderTarget = ColorRT->GameThread_GetRenderTargetResource();
+		CSParams.TerrainTypes = Snapshot.TerrainTypes;
+
+		FProceduralLandmassNoiseCSInterface::Dispatch(CSParams);
+
+		// Block until GPU finishes (required: RT must be ready for material)
+		FlushRenderingCommands();
+
+		UMaterialInstanceDynamic* DynMat = UMaterialInstanceDynamic::Create(MaterialToApply, this);
+		DynMat->SetTextureParameterValue(TEXT("TerrainColorTexture"), ColorRT);
+		TerrainMeshComponent->SetMaterial(0, DynMat);
+
+		// Clean up temporary height RT (not needed after material is applied)
+		HeightRT = nullptr;
+		bIsGenerating = false;
+		return;
 	}
 
 	TerrainMeshComponent->SetMaterial(0, MaterialToApply);
