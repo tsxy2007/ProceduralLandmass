@@ -31,7 +31,10 @@ RWTexture2D<float> RenderTarget;
 struct FTerrainTypeGPU
 {
 	float  NoiseHeight;   // offset 0
-	float4 Color;         // offset 16 (float4 在 HLSL structured buffer 中对齐到 16 bytes)
+	float  _Padding0;     // offset 4  — explicit padding to match C++ FTerrainTypeGPU layout
+	float  _Padding1;     // offset 8
+	float  _Padding2;     // offset 12
+	float4 Color;         // offset 16
 };
 
 StructuredBuffer<FTerrainTypeGPU> TerrainTypes;

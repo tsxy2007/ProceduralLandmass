@@ -50,7 +50,11 @@ struct FTerrainTypeGPU
 		: NoiseHeight(Src.NoiseHeight)
 		, ColorR(Src.Color.R), ColorG(Src.Color.G)
 		, ColorB(Src.Color.B), ColorA(Src.Color.A)
-	{}
+	{
+		_Padding[0] = 0;
+		_Padding[1] = 0;
+		_Padding[2] = 0;
+	}
 };
 static_assert(sizeof(FTerrainTypeGPU) == 32, "FTerrainTypeGPU must match HLSL 32-byte layout");
 
