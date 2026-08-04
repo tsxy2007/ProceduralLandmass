@@ -154,8 +154,12 @@ void MainComputeShader(uint3 DispatchThreadId : SV_DispatchThreadID)
 
 	float noise = fBm(p, Octaves, Persistence, Lacunarity);
 
-	// Map [-1, 1] → [0, 1]
-	float normalized = (noise + 1.0) * 0.5;
+	// ── 对比度补偿：把 fBm 的实际范围拉伸回 [0,1] ─────────────────
+	// fBm 归一化后实际只分布在 ±0.3 附近（单倍频 Perlin 经验范围
+	// 约 ±0.5~0.8，远小于理论 ±1），直接 (noise+1)*0.5 只会落在
+	// [0.35,0.68] 一带。乘上增益后用 smoothstep 软钳位铺满 [0,1]。
+	// 增益按 Scale 调整：Scale 大用小值（2~3），Scale 小用大值（3~4）。
+	float normalized = smoothstep(-1.0, 1.0, noise * 3.0);
 
 	// Color lookup from terrain types (threshold-based, first-match wins)
 	float4 outColor = float4(0.0, 0.0, 0.0, 1.0);
