@@ -1,0 +1,111 @@
+/**
+ * TerrainMeshGenCS Compute Shader — GPU Terrain Mesh Generation (Approach A)
+ *
+ * Reads the noise heightmap RenderTarget (output from ProceduralLandmassNoise.usf)
+ * and writes vertex positions, normals, UVs, and triangle indices into GPU buffers.
+ * The resulting buffers can be used for DrawIndexedPrimitiveIndirect or readback.
+ *
+ * Algorithm: One thread per grid vertex. Interior threads also emit 6 indices
+ * (2 triangles) for their quad. Normals are computed via central-difference
+ * neighbor sampling from the heightmap.
+ */
+
+#include "/Engine/Public/Platform.ush"
+
+// ── Inputs (bound via SHADER_PARAMETER_STRUCT in C++) ──────────────────────
+
+Texture2D<float> HeightMap;    // PF_R32_FLOAT noise RT from ProceduralLandmassNoise.usf
+int   GridSize;                // vertices per side (e.g. 128)
+float HeightScale;             // world-space height multiplier
+float2 WorldOrigin;            // world-space XY offset
+
+// ── Output UAVs ────────────────────────────────────────────────────────────
+
+RWStructuredBuffer<float4> OutPositions;   // float4(WorldPosition.xyz, 1.0)
+RWStructuredBuffer<float4> OutNormals;     // float4(Normal.xyz, 0.0)
+RWStructuredBuffer<float2> OutUVs;         // float2(U, V)
+RWStructuredBuffer<uint>  OutIndices;      // 3 uint per triangle, 6 per quad
+
+// ── Thread-group size (set via ModifyCompilationEnvironment) ────────────────
+
+#ifndef THREADGROUPSIZE_X
+#define THREADGROUPSIZE_X 8
+#endif
+#ifndef THREADGROUPSIZE_Y
+#define THREADGROUPSIZE_Y 8
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Normal from central-difference (neighbor height samples)
+// ═══════════════════════════════════════════════════════════════════════════
+
+float3 ComputeNormal(uint2 coord, float texelSize)
+{
+	uint2 left  = uint2(max(int(coord.x) - 1, 0), coord.y);
+	uint2 right = uint2(min(coord.x + 1, GridSize - 1), coord.y);
+	uint2 up    = uint2(coord.x, min(coord.y + 1, GridSize - 1));
+	uint2 down  = uint2(coord.x, max(int(coord.y) - 1, 0));
+
+	float hl = HeightMap[left]  * HeightScale;
+	float hr = HeightMap[right] * HeightScale;
+	float hu = HeightMap[up]    * HeightScale;
+	float hd = HeightMap[down]  * HeightScale;
+
+	float3 tangent   = normalize(float3(2.0 * texelSize, hr - hl, 0));
+	float3 bitangent = normalize(float3(0, hu - hd, 2.0 * texelSize));
+	return normalize(cross(tangent, bitangent));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Main entry point
+// ═══════════════════════════════════════════════════════════════════════════
+
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, 1)]
+void MainTerrainMeshGenCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint x = DispatchThreadId.x;
+	uint y = DispatchThreadId.y;
+
+	if (x >= (uint)GridSize || y >= (uint)GridSize)
+		return;
+
+	uint vidx = y * GridSize + x;
+
+	// ── Vertex from height RT ──────────────────────────────────────────────
+	float height   = HeightMap[uint2(x, y)];
+	float halfSize = float(GridSize - 1) * 0.5;
+
+	float3 worldPos = float3(
+		float(x) - halfSize + WorldOrigin.x,
+		float(y) - halfSize + WorldOrigin.y,
+		height * HeightScale);
+
+	// ── Write vertex data ───────────────────────────────────────────────────
+	OutPositions[vidx] = float4(worldPos, 1.0);
+	OutNormals[vidx]   = float4(ComputeNormal(uint2(x, y), 1.0), 0.0);
+	OutUVs[vidx]       = float2(
+		float(x) / float(GridSize - 1),
+		float(y) / float(GridSize - 1));
+
+	// ── Emit triangles for this quad (interior vertices only) ──────────────
+	if (x < (uint)(GridSize - 1) && y < (uint)(GridSize - 1))
+	{
+		uint quadIdx = (y * (GridSize - 1) + x) * 6;
+
+		// Quad corners (row-major grid)
+		uint v00 = vidx;                          // (x,   y  )
+		uint v10 = y * GridSize + (x + 1);        // (x+1, y  )
+		uint v01 = (y + 1) * GridSize + x;        // (x,   y+1)
+		uint v11 = (y + 1) * GridSize + (x + 1);  // (x+1, y+1)
+
+		// Triangle 1: v00 - v11 - v01  (matches CPU-side winding order)
+		OutIndices[quadIdx + 0] = v00;
+		OutIndices[quadIdx + 1] = v11;
+		OutIndices[quadIdx + 2] = v01;
+
+		// Triangle 2: v11 - v00 - v10
+		OutIndices[quadIdx + 3] = v11;
+		OutIndices[quadIdx + 4] = v00;
+		OutIndices[quadIdx + 5] = v10;
+	}
+}

@@ -10,6 +10,8 @@
 class UStaticMeshComponent;
 class UCurveFloat;
 class UMaterialInterface;
+class UTextureRenderTarget2D;
+class FTerrainMeshSceneViewExtension;
 
 /**
  * Async variant of AProceduralLandmassActor using a pipeline + ticket queue pattern.
@@ -81,6 +83,21 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Terrain", meta = (ClampMin = "1", ClampMax = "8"))
 	int32 LODLevels = 1;
 
+	// ---- GPU mesh generation ----
+
+	/** When enabled, uses GPU compute shaders for both noise and mesh generation instead of CPU. */
+	UPROPERTY(EditAnywhere, Category = "GPU")
+	bool bUseGPUMeshGeneration = false;
+
+	/**
+	 * When enabled, renders terrain directly via SM6 mesh shader through a scene view extension.
+	 * No CPU mesh is created — the terrain is regenerated every frame on GPU.
+	 * Requires: SM6 Tier 0 (DX12), r.ProceduralLandmass.MeshShader.Enable != 0
+	 * Mutually exclusive with bUseGPUMeshGeneration — this one takes precedence.
+	 */
+	UPROPERTY(EditAnywhere, Category = "GPU")
+	bool bUseMeshShaderRendering = false;
+
 	// ---- Appearance ----
 
 	UPROPERTY(EditAnywhere, Category = "Appearance")
@@ -112,6 +129,12 @@ private:
 	/** Pipeline step 2: build terrain mesh from noise data (game thread). */
 	void PipelineStep_TerrainMesh(const TArray<float>& NoiseMap, const FGenSnapshot& Snapshot, uint32 Ticket);
 
+	/** Pipeline step 2 (GPU): generate noise + mesh entirely on GPU, then read back. */
+	void PipelineStep_GPUMesh(const FGenSnapshot& Snapshot, uint32 Ticket);
+
+	/** Pipeline step 2 (Mesh Shader): generate noise on GPU, register with view extension for per-frame rendering. */
+	void PipelineStep_MeshShader(FGenSnapshot Snapshot, uint32 Ticket);
+
 	/** Pipeline step 3: apply material with optional color texture (game thread). */
 	void PipelineStep_ApplyMaterial(const FGenSnapshot& Snapshot, const TArray<float>& NoiseMap);
 
@@ -127,4 +150,20 @@ private:
 	// Generated mesh kept alive by UPROPERTY
 	UPROPERTY()
 	TObjectPtr<UStaticMesh> GeneratedMesh;
+
+	// ── Mesh Shader rendering (Approach B) state ─────────────────────────
+
+	/** View extension that injects mesh shader draws into the main render pipeline. */
+	TSharedPtr<FTerrainMeshSceneViewExtension, ESPMode::ThreadSafe> MeshShaderViewExtension;
+
+	/**
+	 * Persistent noise height render target for the mesh shader view extension.
+	 * Created once and updated when terrain params change. The view extension
+	 * samples this RT every frame to generate geometry.
+	 */
+	UPROPERTY()
+	TObjectPtr<UTextureRenderTarget2D> PersistentHeightRT;
+
+	/** One-time setup of the mesh shader view extension. */
+	void SetupMeshShaderViewExt();
 };

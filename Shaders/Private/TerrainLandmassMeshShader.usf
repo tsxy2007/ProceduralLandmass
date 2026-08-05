@@ -1,0 +1,171 @@
+/**
+ * TerrainLandmassMeshShader — GPU Terrain Mesh via Mesh Shader (Approach B)
+ *
+ * Uses SM6 Mesh Shader (no amplification) to generate terrain geometry
+ * directly from the noise heightmap RenderTarget, then shades via a simple
+ * pixel shader. Designed to be injected into the main render pipeline via
+ * FTerrainMeshSceneViewExtension (PostRenderBasePassDeferred).
+ *
+ * Architecture: Each mesh shader group handles one 8×8 tile of the grid.
+ *  - 8×8 = 64 vertices (well within the 256 vertex limit)
+ *  - (8-1)² × 2 = 98 triangles (well within the 256 primitive limit)
+ *
+ * Reference: UE5 Nanite HWRasterizeMS in NaniteRasterizer.usf.
+ */
+
+#include "/Engine/Public/Platform.ush"
+
+#if PLATFORM_SUPPORTS_MESH_SHADERS_TIER0
+
+#include "/Engine/Public/Platform/D3D/D3DCommon.ush"
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+
+Texture2D<float> HeightMap;          // PF_R32_FLOAT noise RT
+int   GridSize;                      // vertices per side (e.g. 128)
+float HeightScale;                   // world-space height multiplier
+float2 WorldOrigin;                  // world-space XY offset
+float4x4 ViewProjectionMatrix;       // world → clip transform (passed from C++)
+
+// ── Tile constants ──────────────────────────────────────────────────────────
+
+#define TILE_SIZE  8
+#define TILE_VERTS (TILE_SIZE * TILE_SIZE)                         // 64
+#define TILE_PRIMS ((TILE_SIZE - 1) * (TILE_SIZE - 1) * 2)        // 98
+
+// ── Vertex output struct (feeds pixel shader) ───────────────────────────────
+
+struct FTerrainMeshVOut
+{
+	float4 Position : SV_POSITION;
+	float3 WorldPos  : TEXCOORD0;   // world-space position for lighting
+	float3 Normal    : NORMAL;
+	float2 UV        : TEXCOORD1;
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Normal computation helper
+// ═══════════════════════════════════════════════════════════════════════════
+
+float3 ComputeTerrainNormal(uint2 coord)
+{
+	// Central-difference sampling of the heightmap
+	uint2 left  = uint2(max(int(coord.x) - 1, 0), coord.y);
+	uint2 right = uint2(min(coord.x + 1, (uint)(GridSize - 1)), coord.y);
+	uint2 down  = uint2(coord.x, max(int(coord.y) - 1, 0));
+	uint2 up    = uint2(coord.x, min(coord.y + 1, (uint)(GridSize - 1)));
+
+	float texelSize = 1.0;  // heightmap is 1:1 with vertices
+	float hl = HeightMap[left]  * HeightScale;
+	float hr = HeightMap[right] * HeightScale;
+	float hd = HeightMap[down]  * HeightScale;
+	float hu = HeightMap[up]    * HeightScale;
+
+	float3 tangent   = normalize(float3(2.0 * texelSize, hr - hl, 0.0));
+	float3 bitangent = normalize(float3(0.0, hu - hd, 2.0 * texelSize));
+	return normalize(cross(tangent, bitangent));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Mesh Shader — generates terrain geometry on GPU
+// ═══════════════════════════════════════════════════════════════════════════
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+[outputtopology("triangle")]
+void MainTerrainMeshMS(
+	uint GTid : SV_GroupThreadID,
+	uint3 GID : SV_GroupID,
+	MESH_SHADER_VERTEX_EXPORT(FTerrainMeshVOut, TILE_VERTS),
+	MESH_SHADER_TRIANGLE_EXPORT(TILE_PRIMS))
+{
+	// ── Map group-thread → local tile coords ───────────────────────────────
+	uint lx = GTid % TILE_SIZE;
+	uint ly = GTid / TILE_SIZE;
+
+	// ── Map group ID → global tile offset ──────────────────────────────────
+	uint tilesPerRow = (GridSize + TILE_SIZE - 1) / TILE_SIZE;
+	uint tileX = GID.x % tilesPerRow;
+	uint tileY = GID.x / tilesPerRow;
+	uint gx = tileX * TILE_SIZE + lx;
+	uint gy = tileY * TILE_SIZE + ly;
+
+	// ── Clamp to grid (edge tiles may launch threads beyond GridSize) ──────
+	bool valid = (gx < (uint)GridSize && gy < (uint)GridSize);
+	SetMeshOutputCounts(valid ? TILE_VERTS : 0, valid ? TILE_PRIMS : 0);
+	if (!valid)
+		return;
+
+	// ── Sample height from noise RT ────────────────────────────────────────
+	float height   = HeightMap[uint2(gx, gy)];
+	float halfSize = float(GridSize - 1) * 0.5;
+
+	float3 worldPos = float3(
+		float(gx) - halfSize + WorldOrigin.x,
+		float(gy) - halfSize + WorldOrigin.y,
+		height * HeightScale);
+
+	// ── Write vertex ───────────────────────────────────────────────────────
+	FTerrainMeshVOut vtx;
+	vtx.Position = mul(float4(worldPos, 1.0), ViewProjectionMatrix);
+	vtx.WorldPos = worldPos;
+	vtx.Normal   = ComputeTerrainNormal(uint2(gx, gy));
+	vtx.UV       = float2(float(gx) / float(GridSize - 1), float(gy) / float(GridSize - 1));
+	MESH_SHADER_WRITE_VERTEX(lx + ly * TILE_SIZE, vtx);
+
+	// ── Write triangles (interior threads only) ────────────────────────────
+	if (lx < TILE_SIZE - 1 && ly < TILE_SIZE - 1)
+	{
+		uint v00 = ly * TILE_SIZE + lx;
+		uint v10 = ly * TILE_SIZE + (lx + 1);
+		uint v01 = (ly + 1) * TILE_SIZE + lx;
+		uint v11 = (ly + 1) * TILE_SIZE + (lx + 1);
+
+		uint quadIdx = (ly * (TILE_SIZE - 1) + lx) * 2;
+
+		// Triangle 1: v00 - v11 - v01
+		MESH_SHADER_WRITE_TRIANGLE(quadIdx,     uint3(v00, v11, v01));
+		// Triangle 2: v11 - v00 - v10
+		MESH_SHADER_WRITE_TRIANGLE(quadIdx + 1, uint3(v11, v00, v10));
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Pixel Shader — simple NdotL diffuse + ambient
+// ═══════════════════════════════════════════════════════════════════════════
+
+float4 MainTerrainPS(
+	float4 SvPosition : SV_POSITION,
+	float3 WorldPos   : TEXCOORD0,
+	float3 Normal     : NORMAL,
+	float2 UV         : TEXCOORD1) : SV_Target0
+{
+	// ── Lighting constants ────────────────────────────────────────────────
+	const float3 LightDirection  = normalize(float3(0.5, 0.5, 1.0)); // sun-like
+	const float3 LightColor      = float3(1.0, 0.95, 0.8);            // warm
+	const float  AmbientOcclusion = 0.25;
+
+	// ── Diffuse NdotL ─────────────────────────────────────────────────────
+	float3 N = normalize(Normal);
+	float3 L = LightDirection;
+	float NdotL = saturate(dot(N, L));
+
+	// ── Height-based albedo ───────────────────────────────────────────────
+	float height01 = UV.y;
+	float3 lowColor  = float3(0.15, 0.45, 0.1);   // dark green
+	float3 midColor  = float3(0.35, 0.30, 0.20);  // brown rock
+	float3 highColor = float3(0.85, 0.80, 0.75);  // grey/white snow
+
+	float t1 = saturate(height01 * 2.0);          // low→mid at 0.5
+	float t2 = saturate((height01 - 0.6) * 2.5);  // mid→high at 0.6
+	float3 albedo = lerp(lowColor, midColor, t1);
+	albedo = lerp(albedo, highColor, t2);
+
+	// ── Composite ─────────────────────────────────────────────────────────
+	float3 ambient  = albedo * AmbientOcclusion;
+	float3 diffuse  = albedo * LightColor * NdotL;
+	float3 color    = ambient + diffuse;
+
+	return float4(color, 1.0);
+}
+
+#endif // PLATFORM_SUPPORTS_MESH_SHADERS_TIER0
