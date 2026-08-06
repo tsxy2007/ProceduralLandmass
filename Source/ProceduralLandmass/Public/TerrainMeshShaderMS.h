@@ -39,6 +39,14 @@ public:
 		SHADER_PARAMETER(FVector2f, WorldOrigin)
 		SHADER_PARAMETER(FMatrix44f, ViewProjectionMatrix)
 
+		// Camera world-space position (for view-direction calculation in PS)
+		SHADER_PARAMETER(FVector3f, CameraWorldPos)
+
+		// View uniform buffer (auto-bound in standard passes, explicit in custom passes)
+		// Provides: DirectionalLightColor, DirectionalLightDirection,
+		//           AtmosphereLightIlluminance*, SkyAtmosphere*, IndirectLightingColorScale
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+
 		// Render target bindings — required for rasterization passes via RDG
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()
@@ -72,6 +80,12 @@ public:
 	SHADER_USE_PARAMETER_STRUCT(FTerrainMeshShaderPS, FGlobalShader);
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		// View uniform buffer — needed for BRDF.ush PBR lighting in the PS
+		// (DirectionalLightColor, DirectionalLightDirection, SkyAtmosphere*, etc.)
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+
+		// Camera world-space position for view-direction calculation (V = Cam - Pos)
+		SHADER_PARAMETER(FVector3f, CameraWorldPos)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)

@@ -140,7 +140,7 @@ void FTerrainMeshSceneViewExtension::PostRenderBasePassDeferred_RenderThread(
 		return;
 	}
 
-	// ── Guard: CVar verbose mode? ──────────────────────────────────────────
+	// ── Guard: CVar ────────────────────────────────────────────────────────
 	const int32 CVarMode = CVarMeshShaderViewExt.GetValueOnRenderThread();
 	if (CVarMode == 0)
 	{
@@ -217,6 +217,8 @@ void FTerrainMeshSceneViewExtension::PostRenderBasePassDeferred_RenderThread(
 	PassParameters->HeightScale = HeightScale;
 	PassParameters->WorldOrigin = WorldOrigin;
 	PassParameters->ViewProjectionMatrix = ViewProjMatrix;
+	PassParameters->CameraWorldPos = FVector3f(InView.ViewMatrices.GetViewOrigin());
+	PassParameters->View = InView.ViewUniformBuffer;
 
 	// Bind scene render targets — RDG handles resource transitions
 	PassParameters->RenderTargets[0] = FRenderTargetBinding(
@@ -271,6 +273,17 @@ void FTerrainMeshSceneViewExtension::PostRenderBasePassDeferred_RenderThread(
 			// ── Bind shader parameters + dispatch ──────────────────────────
 			SetShaderParameters(RHICmdList, MeshShader,
 				const_cast<FRHIMeshShader*>(MeshShaderRHI), *PassParameters);
+
+			// Pixel shader needs its own View UFB + CameraWorldPos binding
+			// (D3D12 binds constant buffers per-stage; MS bindings are
+			//  NOT visible to the PS)
+			{
+				FTerrainMeshShaderPS::FParameters PSParams;
+				PSParams.View = PassParameters->View;
+				PSParams.CameraWorldPos = PassParameters->CameraWorldPos;
+				SetShaderParameters(RHICmdList, PixelShader,
+					PixelShader.GetPixelShader(), PSParams);
+			}
 
 			RHICmdList.DispatchMeshShader(NumGroups, 1, 1);
 		});

@@ -2,9 +2,12 @@
  * TerrainLandmassMeshShader — GPU Terrain Mesh via Mesh Shader (Approach B)
  *
  * Uses SM6 Mesh Shader (no amplification) to generate terrain geometry
- * directly from the noise heightmap RenderTarget, then shades via a simple
- * pixel shader. Designed to be injected into the main render pipeline via
- * FTerrainMeshSceneViewExtension (PostRenderBasePassDeferred).
+ * directly from the noise heightmap RenderTarget, then shades via PBR
+ * using UE5's View uniform buffer (DirectionalLightColor/Direction +
+ * atmosphere sky contribution) and BRDF.ush (GGX/Smith/Schlick).
+ *
+ * Dispatch: FTerrainMeshSceneViewExtension::PostRenderBasePassDeferred_RenderThread
+ * (after base pass, writes to SceneColor; View uniform buffer is auto-bound)
  *
  * Architecture: Each mesh shader group handles one 8×8 tile of the grid.
  *  - 8×8 = 64 vertices (well within the 256 vertex limit)
@@ -26,6 +29,7 @@ int   GridSize;                      // vertices per side (e.g. 128)
 float HeightScale;                   // world-space height multiplier
 float2 WorldOrigin;                  // world-space XY offset
 float4x4 ViewProjectionMatrix;       // world → clip transform (passed from C++)
+float3 CameraWorldPos;               // camera world position for view vector
 
 // ── Tile constants ──────────────────────────────────────────────────────────
 
@@ -130,8 +134,21 @@ void MainTerrainMeshMS(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Pixel Shader — simple NdotL diffuse + ambient
+//  Pixel Shader — UE5 PBR lighting via View uniform buffer
+//
+//  Uses BRDF.ush (GGX / Smith / Schlick) for physically-based shading.
+//  Directional light color & direction are read from the View uniform
+//  buffer, which maps to the engine's primary directional light (sun).
+//  Atmospheric sky contribution is also sampled from View for ambient.
+//
+//  The View uniform buffer is auto-bound by UE5 for all raster passes —
+//  no explicit C++ parameter binding required.
+//
+//  Reference: UE5 BRDF.ush, DeferredLightingCommon.ush
 // ═══════════════════════════════════════════════════════════════════════════
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/BRDF.ush"
 
 float4 MainTerrainPS(
 	float4 SvPosition : SV_POSITION,
@@ -139,33 +156,69 @@ float4 MainTerrainPS(
 	float3 Normal     : NORMAL,
 	float2 UV         : TEXCOORD1) : SV_Target0
 {
-	// ── Lighting constants ────────────────────────────────────────────────
-	const float3 LightDirection  = normalize(float3(0.5, 0.5, 1.0)); // sun-like
-	const float3 LightColor      = float3(1.0, 0.95, 0.8);            // warm
-	const float  AmbientOcclusion = 0.25;
-
-	// ── Diffuse NdotL ─────────────────────────────────────────────────────
-	float3 N = normalize(Normal);
-	float3 L = LightDirection;
-	float NdotL = saturate(dot(N, L));
-
 	// ── Height-based albedo ───────────────────────────────────────────────
 	float height01 = UV.y;
-	float3 lowColor  = float3(0.15, 0.45, 0.1);   // dark green
-	float3 midColor  = float3(0.35, 0.30, 0.20);  // brown rock
-	float3 highColor = float3(0.85, 0.80, 0.75);  // grey/white snow
+	float3 lowColor  = float3(0.15, 0.45, 0.1);   // dark green (lowland)
+	float3 midColor  = float3(0.35, 0.30, 0.20);  // brown rock (mid)
+	float3 highColor = float3(0.85, 0.80, 0.75);  // grey/white snow (peak)
 
 	float t1 = saturate(height01 * 2.0);          // low→mid at 0.5
 	float t2 = saturate((height01 - 0.6) * 2.5);  // mid→high at 0.6
 	float3 albedo = lerp(lowColor, midColor, t1);
 	albedo = lerp(albedo, highColor, t2);
 
-	// ── Composite ─────────────────────────────────────────────────────────
-	float3 ambient  = albedo * AmbientOcclusion;
-	float3 diffuse  = albedo * LightColor * NdotL;
-	float3 color    = ambient + diffuse;
+	// ── PBR parameters ────────────────────────────────────────────────────
+	const float Metallic  = 0.0;   // non-metal terrain
+	const float Specular  = 0.5;   // default non-metal F0 reflectance
+	const float Roughness = 0.7;   // rough outdoor terrain
 
-	return float4(color, 1.0);
+	float3 N = normalize(Normal);
+	float3 V = normalize(CameraWorldPos - WorldPos.xyz);
+
+	// Engine's primary directional light (sun)
+	float3 L = View.DirectionalLightDirection;
+	float3 LightColor = View.DirectionalLightColor;
+
+	// ── PBR: GGX NDF + Smith Visibility + Schlick Fresnel ─────────────────
+	float a2 = Pow4(Roughness);
+	float3 F0 = lerp(float3(0.04, 0.04, 0.04), albedo, Metallic);
+
+	// Organize dot products via BxDFContext (UE5 standard pattern)
+	BxDFContext Context;
+	Init(Context, N, V, L);
+
+	// Diffuse: Lambert
+	float3 DiffuseContrib = Diffuse_Lambert(albedo);
+
+	// Specular: Microfacet BRDF = D * Vis * F
+	float  D         = D_GGX(a2, Context.NoH);
+	float  Vis       = Vis_SmithJointApprox(a2, Context.NoV, Context.NoL);
+	float3 F         = F_Schlick(F0, Context.VoH);
+	float3 SpecularContrib = (D * Vis) * F;
+
+	// ── Direct lighting ───────────────────────────────────────────────────
+	float  NoL         = saturate(Context.NoL);
+	float3 DirectLight = (DiffuseContrib + SpecularContrib) * (LightColor * NoL);
+
+	// ── Ambient / Indirect ────────────────────────────────────────────────
+	// Atmospheric sky illumination on the ground (scattered sunlight)
+	float3 SkyAmbient = 0.0;
+	if (View.SkyAtmospherePresentInScene > 0.5)
+	{
+		SkyAmbient = View.AtmosphereLightIlluminanceOnGroundPostTransmittance[0].rgb
+		           * View.SkyAtmosphereSkyLuminanceFactor.rgb;
+	}
+	// Hemisphere ambient: dark below, sky-colored above
+	float  hemiT     = N.z * 0.5 + 0.5;  // 0=ground, 1=sky
+	float3 hemiSky   = lerp(float3(0.02, 0.03, 0.05), float3(0.15, 0.25, 0.45), hemiT);
+	float3 Ambient   = albedo * (hemiSky + SkyAmbient * 0.5);
+
+	// ── Composite ─────────────────────────────────────────────────────────
+	float3 Color = DirectLight + Ambient;
+	// Apply indirect lighting scale (exposure / post-process tuning)
+	Color *= View.IndirectLightingColorScale;
+
+	return float4(Color, 1.0);
 }
 
 #endif // PLATFORM_SUPPORTS_MESH_SHADERS_TIER0

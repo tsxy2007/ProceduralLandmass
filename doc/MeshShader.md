@@ -1,229 +1,346 @@
-# FTerrainMeshSceneViewExtension — Mesh Shader 地形渲染
+# TerrainLandmassMeshShader.usf — 代码结构分析
 
-## 概述
+## 文件概览
 
-`FTerrainMeshSceneViewExtension` 通过 SM6 Mesh Shader 将地形几何体直接注入 Unreal 的延迟渲染管线（`PostRenderBasePassDeferred`）。无需 CPU Mesh、无需 Buffer 回读、无需 `UStaticMesh`——每帧在 GPU 上从高度 RT 实时生成地形并写入 GBuffer。
+| 属性 | 值 |
+|------|-----|
+| 文件 | `Plugins/ProceduralLandmass/Shaders/Private/TerrainLandmassMeshShader.usf` |
+| 行数 | ~225 |
+| Shader 类型 | SF_Mesh + SF_Pixel |
+| 平台要求 | SM6 Tier 0 (`PLATFORM_SUPPORTS_MESH_SHADERS_TIER0`) |
+| 入口点 | `MainTerrainMeshMS` (Mesh Shader), `MainTerrainPS` (Pixel Shader) |
+| C++ 绑定 | `FTerrainMeshShaderMS`, `FTerrainMeshShaderPS` (TerrainMeshShaderMS.h) |
+| 集成方式 | `FTerrainMeshSceneViewExtension::PostRenderBasePassDeferred_RenderThread` |
+| 光照方式 | PBR (BRDF.ush GGX/Smith/Schlick) 写入 SceneColor，通过 View UFB 读取场景方向光 |
 
-**平台要求**: SM6 Tier 0（DX12 / Vulkan 1.3），`GRHISupportsMeshShadersTier0 == true`。
-
-## 架构
+## 代码结构图
 
 ```
-┌─ Game Thread ─────────────────────┐   ┌─ Render Thread (每帧) ──────────────────┐
-│                                   │   │                                         │
-│  ViewExt->UpdateHeightmap(RT) ────┼──►│  PostRenderBasePassDeferred             │
-│  ViewExt->UpdateParams(...) ──────┼──►│    │                                    │
-│  ViewExt->SetEnabled(true) ───────┼──►│    ├─ 读 PersistentHeightRT (R32F)      │
-│                                   │   │    ├─ 拿 View.ViewProjectionMatrix       │
-│  FSceneViewExtensions             │   │    ├─ RDG Raster Pass:                  │
-│    ::NewExtension<T>(World)       │   │    │   ├─ MeshShader (8×8 tiles)        │
-│                                   │   │    │   │   ├─ 64 verts, 98 tris/group  │
-│                                   │   │    │   │   └─ Central-diff normals      │
-│                                   │   │    │   └─ PixelShader                   │
-│                                   │   │    │       ├─ NdotL diffuse             │
-│                                   │   │    │       └─ Height-based albedo       │
-│                                   │   │    └─ RT: SceneColor + SceneDepth       │
-│                                   │   │                                         │
-└───────────────────────────────────┘   └─────────────────────────────────────────┘
+TerrainLandmassMeshShader.usf (~225 lines)
+│
+├─ [1-17]    文件头注释 — 架构说明
+├─ [19]      #include "/Engine/Public/Platform.ush"
+├─ [21]      #if PLATFORM_SUPPORTS_MESH_SHADERS_TIER0
+├─ [23]      #include "/Engine/Public/Platform/D3D/D3DCommon.ush"
+│
+├─ [27-32]   ── Inputs（全局 Shader Parameter 声明）
+│            ├─ Texture2D<float> HeightMap        (SRV — PF_R32_FLOAT)
+│            ├─ int   GridSize
+│            ├─ float HeightScale
+│            ├─ float2 WorldOrigin
+│            ├─ float4x4 ViewProjectionMatrix
+│            └─ float3 CameraWorldPos
+│
+├─ [36-38]   ── Tile constants
+│            ├─ #define TILE_SIZE  8
+│            ├─ #define TILE_VERTS 64
+│            └─ #define TILE_PRIMS 98
+│
+├─ [42-48]   ── FTerrainMeshVOut (vertex output struct)
+│            ├─ float4 Position : SV_POSITION
+│            ├─ float3 WorldPos  : TEXCOORD0
+│            ├─ float3 Normal    : NORMAL
+│            └─ float2 UV        : TEXCOORD1
+│
+├─ [54-71]   ── ComputeTerrainNormal(uint2 coord)
+│            └─ 中心差分 (4-neighbor) → tangent/bitangent → cross
+│
+├─ [77-134]  ── Mesh Shader: MainTerrainMeshMS
+│            ├─ [numthreads(8,8,1)] + [outputtopology("triangle")]
+│            ├─ Thread → Tile local → Global coord mapping
+│            ├─ Boundary clamp + SetMeshOutputCounts
+│            ├─ Height sample → WorldPos → VP transform
+│            ├─ MESH_SHADER_WRITE_VERTEX (64 vertices)
+│            └─ MESH_SHADER_WRITE_TRIANGLE (98 triangles)
+│
+├─ [150]     #include "/Engine/Private/Common.ush"
+│            ⚠️ 必须在 BRDF.ush 之前 — 提供 PI, Pow4, Pow5 等定义
+│
+├─ [151]     #include "/Engine/Private/BRDF.ush"
+│
+├─ [153-222] ── Pixel Shader: MainTerrainPS → SV_Target0 (SceneColor)
+│            ├─ Height-based albedo (green→brown→white gradient)
+│            ├─ PBR params: Metallic=0.0, Specular=0.5, Roughness=0.7
+│            ├─ float3 N = normalize(Normal)
+│            ├─ float3 V = normalize(CameraWorldPos - WorldPos)
+│            ├─ float3 L = View.DirectionalLightDirection
+│            ├─ BxDFContext + Init() + Diffuse_Lambert()
+│            ├─ D_GGX() + Vis_SmithJointApprox() + F_Schlick()
+│            ├─ DirectLight = (Diffuse + Specular) * LightColor * NoL
+│            ├─ Ambient = albedo * (hemiSky + SkyAtmosphere)
+│            └─ Composite: Color = (Direct + Ambient) * IndirectLightingColorScale
+│
+└─ [225]      #endif // PLATFORM_SUPPORTS_MESH_SHADERS_TIER0
 ```
 
-## 手动集成
+## 各阶段详解
 
-### 1. 创建并注册
+### 1. Inputs 声明
+
+HLSL 侧声明了 6 个全局输入（5 个 direct + 1 个来自 View UFB），与 C++ 侧参数一一对应：
+
+| HLSL 声明 | C++ SHADER_PARAMETER | 所属 Struct | 语义 |
+|-----------|---------------------|-------------|------|
+| `Texture2D<float> HeightMap` | `SHADER_PARAMETER_SRV(Texture2D<float>, HeightMap)` | MS FParameters | 噪声高度图 SRV，PF_R32_FLOAT |
+| `int GridSize` | `SHADER_PARAMETER(int32, GridSize)` | MS FParameters | 每边顶点数 |
+| `float HeightScale` | `SHADER_PARAMETER(float, HeightScale)` | MS FParameters | 世界空间高度乘数 |
+| `float2 WorldOrigin` | `SHADER_PARAMETER(FVector2f, WorldOrigin)` | MS FParameters | 世界空间 XY 偏移 |
+| `float4x4 ViewProjectionMatrix` | `SHADER_PARAMETER(FMatrix44f, ViewProjectionMatrix)` | MS FParameters | 世界→裁剪变换矩阵 |
+| `float3 CameraWorldPos` | `SHADER_PARAMETER(FVector3f, CameraWorldPos)` | MS + PS FParameters | 相机世界坐标（计算视线方向） |
+| `View.*` (多个字段) | `SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)` | MS + PS FParameters | 方向光、大气散射、间接光缩放 |
+
+### 2. Tile 常量
+
+```hlsl
+#define TILE_SIZE  8                                          // 每 Tile 边长
+#define TILE_VERTS (TILE_SIZE * TILE_SIZE)                    // 64 顶点
+#define TILE_PRIMS ((TILE_SIZE - 1) * (TILE_SIZE - 1) * 2)   // 98 三角形
+```
+
+每个线程组处理一个 8×8 的网格 Tile。64 顶点 + 98 三角形，远低于 Mesh Shader Tier 0 上限（256 顶点/256 三角形）。
+
+**Tile → Group 映射**：
+```
+GridSize = 128 → TilesPerRow = 128/8 = 16
+TotalGroups = 16 × 16 = 256
+
+GroupID.x = 0..255
+  tileX = GroupID.x % 16
+  tileY = GroupID.x / 16
+```
+
+### 3. ComputeTerrainNormal — 中心差分法线
+
+对每个顶点采样四邻域高度，通过切线和副切线叉积计算法线：
+
+```hlsl
+float hl = HeightMap[left]  * HeightScale;    // 左邻域
+float hr = HeightMap[right] * HeightScale;    // 右邻域
+float hd = HeightMap[down]  * HeightScale;    // 下邻域
+float hu = HeightMap[up]    * HeightScale;    // 上邻域
+
+float3 tangent   = normalize(float3(2.0, hr - hl, 0.0));
+float3 bitangent = normalize(float3(0.0, hu - hd, 2.0));
+
+return normalize(cross(tangent, bitangent));
+```
+
+texel 间距为 1.0（高度图与顶点 1:1 对应），水平跨度为 2 个世界单位。
+
+### 4. MainTerrainMeshMS — Mesh Shader
+
+核心入口，每组 8×8=64 线程。执行流程：
+
+```
+Step 1: Thread → 局部坐标
+  lx = GTid % 8,  ly = GTid / 8
+
+Step 2: GroupID → 全局坐标
+  tilesPerRow = ceil(GridSize / 8)
+  tileX = GID.x % tilesPerRow
+  tileY = GID.x / tilesPerRow
+  gx = tileX * 8 + lx
+  gy = tileY * 8 + ly
+
+Step 3: 越界检测
+  if (gx >= GridSize || gy >= GridSize):
+      SetMeshOutputCounts(0, 0); return;
+
+Step 4: 高度采样 → 世界坐标
+  height = HeightMap[gx, gy]
+  halfSize = (GridSize - 1) / 2
+  worldPos = (gx - halfSize + Origin.x, gy - halfSize + Origin.y, height * Scale)
+
+Step 5: 顶点写入 (MESH_SHADER_WRITE_VERTEX)
+  vtx.Position = mul(worldPos, ViewProjectionMatrix)
+  vtx.WorldPos = worldPos, vtx.Normal = ComputeTerrainNormal(...)
+
+Step 6: 三角形索引 (仅 lx<7 && ly<7)
+  v00 → v11 → v01  (Triangle 0)
+  v11 → v00 → v10  (Triangle 1)
+```
+
+### 5. MainTerrainPS — PBR 光照（SceneColor 输出）
+
+像素着色器执行完整的 PBS（Physically-Based Shading），写入 SceneColor RT。
+
+**关键点：View UFB 必须同时绑定到 Mesh Shader 和 Pixel Shader 阶段。**
+
+在 D3D12 中，常量缓冲区是分阶段绑定的——MS 阶段的 `SHADER_PARAMETER_STRUCT_REF(View)` 绑定对 PS 阶段不可见。因此 `FTerrainMeshShaderPS::FParameters` 也必须声明 `View` 和 `CameraWorldPos`，并在 dispatch 时单独绑定。
+
+**光照模型**：
+
+```
+Diffuse = Diffuse_Lambert(albedo)
+Specular = D_GGX × Vis_SmithJointApprox × F_Schlick(F0)
+DirectLight = (Diffuse + Specular) × DirectionalLightColor × saturate(NoL)
+Ambient = albedo × (hemisphereSky + AtmosphereLightIlluminance × SkyLuminanceFactor × 0.5)
+Final = (DirectLight + Ambient) × IndirectLightingColorScale
+```
+
+**高度渐变 Albedo**：
+```
+lowColor  = (0.15, 0.45, 0.10)  // 深绿 (低地)
+midColor  = (0.35, 0.30, 0.20)  // 棕岩 (中山)
+highColor = (0.85, 0.80, 0.75)  // 灰白 (积雪)
+
+t1 = saturate(height01 * 2.0)           // low→mid at y=0.5
+t2 = saturate((height01 - 0.6) * 2.5)   // mid→high at y=0.6
+albedo = lerp(lowColor, midColor, t1)
+albedo = lerp(albedo, highColor, t2)
+```
+
+**使用的 View UFB 字段**：
+
+| HLSL 访问 | View UFB 字段 | 作用 |
+|-----------|--------------|------|
+| `View.DirectionalLightDirection` | `FVector4f DirectionalLightDirection` | 主方向光方向 |
+| `View.DirectionalLightColor` | `FLinearColor DirectionalLightColor` | 主方向光颜色 |
+| `View.SkyAtmospherePresentInScene` | `float SkyAtmospherePresentInScene` | 是否有天空大气 |
+| `View.AtmosphereLightIlluminanceOnGroundPostTransmittance[0]` | `FLinearColor[]` | 大气散射地面辐照度 |
+| `View.SkyAtmosphereSkyLuminanceFactor` | `FLinearColor SkyAtmosphereSkyLuminanceFactor` | 天空亮度因子 |
+| `View.IndirectLightingColorScale` | `FLinearColor IndirectLightingColorScale` | 间接光颜色缩放 |
+
+## C++ 侧架构
+
+### Shader 类（TerrainMeshShaderMS.h）
+
+两个 Global Shader 类，各有独立的 FParameters：
 
 ```cpp
-#include "TerrainMeshSceneViewExtension.h"
+// Mesh Shader — 拥有网格参数 + 渲染目标
+class FTerrainMeshShaderMS : public FGlobalShader {
+    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        SHADER_PARAMETER_SRV(Texture2D<float>, HeightMap)
+        SHADER_PARAMETER(int32, GridSize)
+        SHADER_PARAMETER(float, HeightScale)
+        SHADER_PARAMETER(FVector2f, WorldOrigin)
+        SHADER_PARAMETER(FMatrix44f, ViewProjectionMatrix)
+        SHADER_PARAMETER(FVector3f, CameraWorldPos)       // 相机世界坐标
+        SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+        RENDER_TARGET_BINDING_SLOTS()                     // SceneColor + Depth
+    END_SHADER_PARAMETER_STRUCT()
+};
 
-TSharedPtr<FTerrainMeshSceneViewExtension> ViewExt;
-
-void AMyActor::BeginPlay()
-{
-    Super::BeginPlay();
-
-    // 注册到当前 World 的场景渲染管线
-    ViewExt = FSceneViewExtensions::NewExtension<FTerrainMeshSceneViewExtension>(GetWorld());
-}
-```
-
-### 2. 准备高度 RenderTarget
-
-ViewExtension 需要一个 `PF_R32_FLOAT` 格式的 RenderTarget，每个像素存储一个 [0,1] 的高度值：
-
-```cpp
-void AMyActor::SetupHeightRT()
-{
-    HeightRT = NewObject<UTextureRenderTarget2D>(this);
-    HeightRT->RenderTargetFormat = RTF_R32f;
-    HeightRT->InitAutoFormat(GridSize, GridSize);  // e.g. 128×128
-    HeightRT->UpdateResourceImmediate(true);
-}
-```
-
-往 RT 写入内容（例如使用 Noise Compute Shader）：
-
-```cpp
-FProceduralLandmassNoiseCSParameters NoiseParams(GridSize, Scale, Octaves,
-    Persistence, Lacunarity, Seed, Offset);
-NoiseParams.RenderTarget = HeightRT->GameThread_GetRenderTargetResource();
-FProceduralLandmassNoiseCSInterface::Dispatch(NoiseParams);
-FlushRenderingCommands();  // 确保 GPU 写完
-```
-
-### 3. 更新 ViewExtension
-
-```cpp
-// 传入高度 RT（ViewExtension 内部用 FTextureRHIRef 引用计数，RT 可以被 GC 回收）
-ViewExt->UpdateHeightmap(HeightRT);
-
-// 传入网格参数
-ViewExt->UpdateParams(/*GridSize*/ 128, /*HeightScale*/ 1000.0f, /*WorldOrigin*/ FVector2f::ZeroVector);
-
-// 激活每帧渲染
-ViewExt->SetEnabled(true);
-```
-
-### 4. 开启 CVar
-
-ViewExtension 受到 CVar 全局开关保护，默认关闭：
-
-```
-r.ProceduralLandmass.MeshShader.Enable 1
-```
-
-| 值 | 行为 |
-|----|------|
-| `0` | 关闭（默认） |
-| `1` | 开启 + 日志摘要 |
-| `2` | 详细日志（每次 dispatch 都打印参数） |
-
-### 5. 清理
-
-`TSharedPtr` 出作用域后自动取消注册。手动释放：
-
-```cpp
-void AMyActor::EndPlay(const EEndPlayReason::Type Reason)
-{
-    if (ViewExt.IsValid())
-    {
-        ViewExt->SetEnabled(false);
-        ViewExt.Reset();  // 从 FSceneViewExtensions 注销
-    }
-    Super::EndPlay(Reason);
-}
-```
-
-## 通过 AProceduralLandmassAsyncActor 使用（已集成）
-
-在编辑器中选中 Actor，Details 面板：
-
-| Group | Property | Value |
-|-------|----------|-------|
-| **GPU** | Mesh Shader Rendering | `true` |
-| Noise | ChunkSize | `128` |
-| Noise | HeightScale | `1000` |
-| Noise | Scale / Octaves / Seed | 按需设置 |
-
-控制台: `r.ProceduralLandmass.MeshShader.Enable 1`
-
-Actor 自动：
-1. 生成 Noise RT
-2. 注册 ViewExtension
-3. 更新高度图和参数
-4. 销毁时清理 ViewExtension
-
-## 激活条件
-
-`IsActiveThisFrame_Internal` 在以下情况返回 `false`（跳过当前帧）：
-
-```cpp
-// 1. World 已失效
-if (!FWorldSceneViewExtension::IsActiveThisFrame_Internal(Context)) return false;
-
-// 2. 未通过 SetEnabled(true) 启用
-if (!bEnabled) return false;
-
-// 3. 未调用过 UpdateHeightmap（无有效数据）
-if (!bRTDataValid) return false;
-
-// 4. CVar 全局关闭
-if (r.ProceduralLandmass.MeshShader.Enable == 0) return false;
-
-// 5. 平台不支持 Mesh Shader
-if (!GRHISupportsMeshShadersTier0) return false;
-```
-
-## API 参考
-
-```cpp
-class FTerrainMeshSceneViewExtension : public FWorldSceneViewExtension
-{
-public:
-    // 构造。通过 FSceneViewExtensions::NewExtension<T>(World) 调用。
-    FTerrainMeshSceneViewExtension(const FAutoRegister& AutoReg, UWorld* InWorld);
-
-    // ── Game Thread API ────────────────────────────────────────────────
-
-    /** 启用/禁用每帧渲染。 */
-    void SetEnabled(bool bInEnabled);
-
-    /**
-     * 更新高度 RenderTarget。
-     * @param RT  PF_R32_FLOAT 格式，GridSize×GridSize 尺寸。
-     *            内部提取 FTextureRHIRef 引用计数，调用后 RT 可被 GC。
-     *            传 nullptr 清除数据并停用。
-     */
-    void UpdateHeightmap(UTextureRenderTarget2D* RT);
-
-    /**
-     * 更新网格参数。
-     * @param InGridSize    每边顶点数（总顶点数 = GridSize²）
-     * @param InHeightScale 世界空间高度缩放
-     * @param InWorldOrigin 世界空间 XY 偏移
-     */
-    void UpdateParams(int32 InGridSize, float InHeightScale, FVector2f InWorldOrigin);
-
-    // ── ISceneViewExtension Overrides ───────────────────────────────────
-
-    void SetupViewFamily(FSceneViewFamily&) override {}
-    void SetupView(FSceneViewFamily&, FSceneView&) override {}
-    void BeginRenderViewFamily(FSceneViewFamily&) override {}
-
-    /** 核心：每帧在 Base Pass 之后注入 Mesh Shader 绘制。 */
-    void PostRenderBasePassDeferred_RenderThread(
-        FRDGBuilder& GraphBuilder,
-        FSceneView& InView,
-        const FRenderTargetBindingSlots& RenderTargets,
-        TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextures) override;
-
-    int32 GetPriority() const override { return 0; }
+// Pixel Shader — 需要独立的 View UFB + CameraWorldPos 绑定
+class FTerrainMeshShaderPS : public FGlobalShader {
+    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+        SHADER_PARAMETER(FVector3f, CameraWorldPos)
+    END_SHADER_PARAMETER_STRUCT()
 };
 ```
 
-## 相关文件
+### Scene View Extension（TerrainMeshSceneViewExtension.cpp）
 
-| 文件 | 作用 |
-|------|------|
-| `TerrainMeshSceneViewExtension.h/.cpp` | ViewExtension 实现 |
-| `TerrainMeshShaderMS.h/.cpp` | Mesh Shader + Pixel Shader C++ 绑定 |
-| `TerrainLandmassMeshShader.usf` | HLSL: `MainTerrainMeshMS` + `MainTerrainPS` |
-| `ProceduralLandmassAsyncActor.h/.cpp` | Actor 集成示例 |
-| `TerrainMeshGenCS.h/.cpp` | Approach A: Compute Shader 方案（对比） |
+```
+PostRenderBasePassDeferred_RenderThread()    ← ISceneViewExtension hook
+  │
+  ├─ Guard: bRTDataValid, CVar, GRHISupportsMeshShadersTier0
+  ├─ RenderTargets.Output[0] → SceneColor RT  (ELoad, 保留已渲染内容)
+  ├─ RenderTargets.DepthStencil → SceneDepth  (ELoad)
+  ├─ RegisterExternalTexture(HeightmapRHI)     RDG 注册
+  ├─ AllocParameters<MS::FParameters>()
+  │   ├─ HeightMap SRV, GridSize, HeightScale, WorldOrigin
+  │   ├─ ViewProjectionMatrix, CameraWorldPos, View
+  │   ├─ RenderTargets[0] = SceneColor
+  │   └─ RenderTargets.DepthStencil = SceneDepth
+  │
+  └─ AddPass(Raster, λ)
+      ├─ PSO: CW_RGBA blend, DepthNearOrEqual × Write
+      ├─ SetGraphicsPipelineState()             (1 RT enabled)
+      ├─ SetShaderParameters(MS, *PassParams)   绑定 MS 参数
+      ├─ SetShaderParameters(PS, PSParams)      绑定 PS 参数 ← 关键!
+      └─ DispatchMeshShader(NumGroups, 1, 1)
+```
 
-## 限制
+### 参数绑定顺序（关键）
 
-- **SM6 only** — DX11 不可用，`IsActiveThisFrame` 自动返回 false
-- **单个 RT** — ViewExtension 只有一个高度 RT，多个地形需要多个 Extension 实例
-- **ViewProjectionMatrix** — 自动从当前 `FSceneView` 获取，无需手动设置
-- **Mesh Shader 输出上限** — 每组 256 顶点 + 256 三角形以内。8×8 tile 产生 64 顶点 + 98 三角形，安全
+```cpp
+// 1. MS 参数 — View UFB 绑定到 Mesh Shader 阶段
+SetShaderParameters(RHICmdList, MeshShader, MeshShaderRHI, *PassParameters);
 
-## 两种 GPU 方案对比
+// 2. PS 参数 — 必须单独分配 + 绑定
+FTerrainMeshShaderPS::FParameters PSParams;
+PSParams.View = PassParameters->View;
+PSParams.CameraWorldPos = PassParameters->CameraWorldPos;
+SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParams);
 
-| | Approach A: Compute Shader | Approach B: Mesh Shader |
+// 3. 发起 Draw
+RHICmdList.DispatchMeshShader(NumGroups, 1, 1);
+```
+
+**为什么 PS 需要独立绑定？** D3D12 的 root signature 为每个着色器阶段维护独立的描述符表/常量缓冲区视图。MS 阶段绑定的 `View` constant buffer 不会自动对 PS 可见。UE5 的 SHADER_PARAMETER_STRUCT 系统将参数绑定到特定着色器阶段——MS 的 FParameters 绑定到 SF_Mesh 阶段，PS 的 FParameters 绑定到 SF_Pixel 阶段。
+
+## 为什么要加 Common.ush？
+
+`BRDF.ush` 不是自包含的——它依赖 `Common.ush` 中定义的：
+
+| 符号 | 定义位置 | 用途 |
+|------|---------|------|
+| `PI` | Common.ush:116 | 半球积分归一化 (`Diffuse_Lambert`, `D_GGX`) |
+| `Pow4(x)` | Common.ush:964 | GGX 粗糙度参数 (`a2 = Pow4(Roughness)`) |
+| `Pow5(x)` | Common.ush:988 | Schlick Fresnel 的 Fc 项 (`F_Schlick`) |
+
+在标准 UE 渲染管线中，`Common.ush` 通过多层 include 链被拉入（MaterialTemplate.ush → LocalVertexFactory.ush → ...），但自定义 Mesh Shader 插件的 include 链较短，必须手动 include。
+
+## Dispatch 生命周期
+
+```
+Actor::BeginPlay()
+  └─ SetupMeshShaderViewExt()
+      ├─ FSceneViewExtensions::NewExtension<T>(World)    创建 View Extension
+      ├─ ViewExt->UpdateHeightmap(HeightRT)               传递 R32F 高度图 RT
+      ├─ ViewExt->UpdateParams(GridSize, Scale, Origin)   传递网格参数
+      └─ ViewExt->SetEnabled(true)                        激活
+           │
+           ▼ 每帧 ─────────────────────────────────────
+          IsActiveThisFrame_Internal()
+           │  检查: bEnabled + bRTDataValid + CVar + RHISupport
+           │
+           ▼ 渲染线程
+          PostRenderBasePassDeferred_RenderThread()
+           │  在 Base Pass (GBuffer) 完成后、Deferred Lighting 之前
+           │  直接写入 SceneColor，与已渲染几何体混合
+           └──────────────────────────────────────────
+```
+
+## 激活条件（IsActiveThisFrame_Internal）
+
+每帧检查 5 个条件：
+
+1. `FWorldSceneViewExtension::IsActiveThisFrame_Internal()` — World 有效
+2. `bEnabled.load()` — `SetEnabled(true)` 已调用
+3. `bRTDataValid` — `UpdateHeightmap()` 成功获取 RHI 纹理
+4. `CVarMeshShaderViewExt != 0` — 控制台变量 `r.ProceduralLandmass.MeshShader.Enable`
+5. `GRHISupportsMeshShadersTier0` — 平台支持 DX12/Vulkan 1.3
+
+## 与 Approach A (Compute Shader) 对比
+
+| | Approach A: CS → CPU Readback | Approach B: Mesh Shader |
 |---|---|---|
-| Shader | `TerrainMeshGenCS.usf` (SF_Compute) | `TerrainLandmassMeshShader.usf` (SF_Mesh + SF_Pixel) |
-| 输出 | GPU Buffers → CPU 回读 → UStaticMesh | 直接光栅化到 SceneColor |
-| CPU Mesh | 有 | 无 |
-| 每帧 GPU 开销 | 无（生成后是 StaticMesh） | 每帧重新生成几何体 |
-| 平台 | SM5+ | SM6 Tier 0 (DX12/Vulkan 1.3) |
-| 编辑/选中 | 正常（StaticMeshComponent） | 无（GPU 程序化几何体） |
-| 启用属性 | `bUseGPUMeshGeneration` | `bUseMeshShaderRendering` |
+| **Shader 类型** | SF_Compute | SF_Mesh + SF_Pixel |
+| **输出** | UAV → Buffer → CPU → UStaticMesh | GPU 直写 SceneColor |
+| **CPU 开销** | 生成一次性 StaticMesh | 每帧 0 字节 CPU↔GPU 传输 |
+| **光照** | 标准 Deferred (StaticMesh) | BRDF.ush PBR + View UFB DirectionalLight |
+| **动态更新** | 需重新 Dispatch CS + Readback | 每帧直接从 RT 读取 |
+| **编辑器交互** | 正常 (StaticMeshComponent) | 无 (GPU 几何体不可选) |
+| **平台要求** | SM5+ | SM6 Tier 0 |
+| **适用场景** | 静态地形 | 实时变化地形 / 全 GPU 管线 |
+
+## 文件依赖
+
+```
+TerrainLandmassMeshShader.usf
+├── /Engine/Public/Platform.ush               (PLATFORM_SUPPORTS_MESH_SHADERS_TIER0)
+├── /Engine/Public/Platform/D3D/D3DCommon.ush (MESH_SHADER_* macros)
+├── /Engine/Private/Common.ush                (PI, Pow4, Pow5, ...)
+└── /Engine/Private/BRDF.ush                  (BxDFContext, D_GGX, Vis_SmithJointApprox, F_Schlick, Diffuse_Lambert)
+
+C++ 侧:
+TerrainMeshShaderMS.h         — FTerrainMeshShaderMS + FTerrainMeshShaderPS (GlobalShader 声明)
+TerrainMeshShaderMS.cpp       — IMPLEMENT_GLOBAL_SHADER + 编译环境
+TerrainMeshGenCS.h            — FTerrainMeshGenParameters (共享参数)
+TerrainMeshSceneViewExtension — 每帧注入 PostRenderBasePassDeferred_RenderThread
+ProceduralLandmassAsyncActor  — Actor 层集成 PipelineStep_MeshShader()
+```

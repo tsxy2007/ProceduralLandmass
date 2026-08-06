@@ -9,17 +9,19 @@
 class UTextureRenderTarget2D;
 
 /**
- * Scene View Extension that injects terrain mesh shader draws into the main
+ * Scene View Extension that injects terrain mesh shader draws into the
  * deferred render pipeline.
  *
- * Every frame (in PostRenderBasePassDeferred), this extension:
+ * Every frame (in PostRenderBasePassDeferred_RenderThread), this extension:
  *   1. Reads the noise heightmap from a GPU RenderTarget
  *   2. Dispatches a SM6 mesh shader (FTerrainMeshShaderMS) that generates
  *      terrain geometry on-the-fly from the heightmap
- *   3. Shades via a pixel shader (FTerrainMeshShaderPS) using NdotL diffuse
+ *   3. Shades via a pixel shader (FTerrainMeshShaderPS) using UE5's PBR
+ *      pipeline: BRDF.ush (GGX/Smith/Schlick) with directional light from
+ *      the View uniform buffer + atmospheric sky ambient
  *
- * The terrain writes directly into the scene's GBuffer + SceneColor —
- * no CPU mesh, no readback, no UStaticMesh involved.
+ * The terrain writes directly into SceneColor — no CPU mesh, no readback,
+ * no UStaticMesh involved.
  *
  * Platform requirement: SM6 Tier 0 (DX12 / Vulkan 1.3) with mesh shader support.
  *
